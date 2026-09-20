@@ -4,7 +4,7 @@ import cors from 'cors';
 import pg from 'pg';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
 
-const APP_VERSION = '3.0.2';
+const APP_VERSION = '3.0.3';
 const app = express();
 
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 
 const env = process.env.PLAID_ENV || 'sandbox';
 const plaidConfigured = Boolean(process.env.PLAID_CLIENT_ID && process.env.PLAID_SECRET);
-const DEFAULT_PLAID_REDIRECT_URI = 'https://payaviator-backend-production.up.railway.app/plaid/oauth-redirect';
+const DEFAULT_PLAID_REDIRECT_URI = 'https://pay-pilot-backend-production.up.railway.app/plaid/oauth-redirect';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || DEFAULT_PLAID_REDIRECT_URI;
 const PLAID_COMPLETION_REDIRECT_URI = process.env.PLAID_COMPLETION_REDIRECT_URI || 'payaviator://plaid-complete';
 const plaidEnv = PlaidEnvironments[env] || PlaidEnvironments.sandbox;
