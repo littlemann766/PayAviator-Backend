@@ -1,3 +1,0 @@
-Pay-Pilot Backend 9.9.6
-- Accounts response now exposes a normalized credit_limit field in addition to Plaid's original balances payload.
-- Access tokens remain backend-only; no secrets are returned to the app.
