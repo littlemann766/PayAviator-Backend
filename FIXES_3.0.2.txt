@@ -1,0 +1,3 @@
+PayAviator Backend 3.0.2
+- Accounts response now exposes a normalized credit_limit field in addition to Plaid's original balances payload.
+- Access tokens remain backend-only; no secrets are returned to the app.

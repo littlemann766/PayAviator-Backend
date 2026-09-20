@@ -4,7 +4,7 @@ import cors from 'cors';
 import pg from 'pg';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
 
-const APP_VERSION = '9.9.6';
+const APP_VERSION = '3.0.2';
 const app = express();
 
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
@@ -19,9 +19,9 @@ app.use((req, res, next) => {
 
 const env = process.env.PLAID_ENV || 'sandbox';
 const plaidConfigured = Boolean(process.env.PLAID_CLIENT_ID && process.env.PLAID_SECRET);
-const DEFAULT_PLAID_REDIRECT_URI = 'https://pay-pilot-backend-production.up.railway.app/plaid/oauth-redirect';
+const DEFAULT_PLAID_REDIRECT_URI = 'https://payaviator-backend-production.up.railway.app/plaid/oauth-redirect';
 const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || DEFAULT_PLAID_REDIRECT_URI;
-const PLAID_COMPLETION_REDIRECT_URI = process.env.PLAID_COMPLETION_REDIRECT_URI || 'paypilot://plaid-complete';
+const PLAID_COMPLETION_REDIRECT_URI = process.env.PLAID_COMPLETION_REDIRECT_URI || 'payaviator://plaid-complete';
 const plaidEnv = PlaidEnvironments[env] || PlaidEnvironments.sandbox;
 const config = new Configuration({
   basePath: plaidEnv,
@@ -64,7 +64,7 @@ async function initStorage() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`);
 
-    // Existing Railway databases may have been created by an older Pay-Pilot
+    // Existing Railway databases may have been created by an older PayAviator
     // backend. CREATE TABLE IF NOT EXISTS does not add columns to an existing
     // table, so apply idempotent migrations before any Plaid item is saved.
     await pool.query('ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS user_id TEXT');
@@ -86,10 +86,10 @@ async function initStorage() {
     await pool.query('ALTER TABLE plaid_pending_links ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()');
     await pool.query('ALTER TABLE plaid_pending_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()');
 
-    console.log('Pay-Pilot database schema verified for 9.5.8.');
+    console.log('PayAviator database schema verified for 9.5.8.');
     dbReady = true;
     dbError = null;
-    console.log('Pay-Pilot database connected.');
+    console.log('PayAviator database connected.');
   } catch (err) {
     // Do not take the whole Plaid API offline just because Postgres is unavailable.
     // Sandbox/testing can continue with in-memory storage while Railway/DB is fixed.
@@ -170,7 +170,7 @@ function plaidError(e, fallback) {
 function requirePlaid(res) {
   if (plaidConfigured) return true;
   res.status(503).json({
-    error: 'Plaid credentials are not configured on the Pay-Pilot backend.',
+    error: 'Plaid credentials are not configured on the PayAviator backend.',
     code: 'PLAID_NOT_CONFIGURED',
   });
   return false;
@@ -215,7 +215,7 @@ async function exchangeAndStore(userId, publicToken, metadata = {}) {
 function healthPayload() {
   return {
     status: 'ok',
-    app: 'Pay-Pilot',
+    app: 'PayAviator',
     version: APP_VERSION,
     plaidEnvironment: env,
     plaidConfigured,
@@ -231,19 +231,19 @@ app.get('/api/health', (req, res) => res.json({...healthPayload(), plaidRedirect
 
 // OAuth/app-to-app handoff target required by Plaid Hosted Link mobile sessions.
 // Plaid requires this value to be HTTPS. This tiny page immediately hands control
-// back to Pay-Pilot's registered custom scheme, where the app resumes status polling.
+// back to PayAviator's registered custom scheme, where the app resumes status polling.
 app.get('/plaid/oauth-redirect', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="0;url=paypilot://plaid-oauth-return"><title>Returning to Pay-Pilot</title></head><body style="font-family:sans-serif;background:#071521;color:white;padding:32px">Returning to Pay-Pilot…<script>location.replace('paypilot://plaid-oauth-return');</script></body></html>`);
+  res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="0;url=payaviator://plaid-oauth-return"><title>Returning to PayAviator</title></head><body style="font-family:sans-serif;background:#071521;color:white;padding:32px">Returning to PayAviator…<script>location.replace('payaviator://plaid-oauth-return');</script></body></html>`);
 });
 
 app.post('/api/plaid/create-link-token', async (req, res) => {
   if (!requirePlaid(res)) return;
-  const userId = String(req.body.userId || 'paypilot-local-user');
+  const userId = String(req.body.userId || 'payaviator-local-user');
   try {
     const request = {
       user: { client_user_id: userId },
-      client_name: 'Pay-Pilot',
+      client_name: 'PayAviator',
       products: [Products.Transactions],
       country_codes: [CountryCode.Us],
       language: 'en',
@@ -380,7 +380,7 @@ app.get('/api/plaid/hosted-status/:userId', async (req, res) => {
 app.post('/api/plaid/exchange-public-token', async (req, res) => {
   if (!requirePlaid(res)) return;
   try {
-    const userId = String(req.body.userId || 'paypilot-local-user');
+    const userId = String(req.body.userId || 'payaviator-local-user');
     if (!req.body.public_token) return res.status(400).json({ error: 'Missing public token.' });
     const out = await exchangeAndStore(userId, req.body.public_token, req.body.metadata || {});
     await clearPending(userId);
@@ -495,7 +495,7 @@ app.get('/api/plaid/transactions/:userId', async (req, res) => {
 const port = Number(process.env.PORT || 8787);
 await initStorage();
 app.listen(port, '0.0.0.0', () => {
-  console.log(`Pay-Pilot backend ${APP_VERSION} listening on 0.0.0.0:${port}`);
+  console.log(`PayAviator backend ${APP_VERSION} listening on 0.0.0.0:${port}`);
   console.log(`Plaid ${plaidConfigured ? 'configured' : 'NOT configured'} (${env}); storage=${useDb() ? 'postgres' : 'memory'}`);
   if (dbError) console.log('Database startup error:', dbError);
 });

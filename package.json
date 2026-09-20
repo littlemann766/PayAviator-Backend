@@ -1,6 +1,6 @@
 {
-  "name": "pay-pilot-backend",
-  "version": "9.12.6",
+  "name": "payaviator-backend",
+  "version": "3.0.2",
   "private": true,
   "type": "module",
   "scripts": {
