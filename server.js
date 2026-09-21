@@ -4,7 +4,7 @@ import cors from 'cors';
 import pg from 'pg';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
 
-const APP_VERSION = '3.1.3';
+const APP_VERSION = '3.1.4';
 const app = express();
 
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
@@ -540,6 +540,31 @@ app.get('/api/plaid/transactions/:userId', async (req,res)=>{
     }
     res.json({transactions:await storedTransactions(userId),fetched_at:new Date().toISOString(),sync,errors});
   }catch(e){console.error('transactions sync failed',e?.response?.data||e);res.status(500).json({error:'transactions_sync_failed',message:e?.response?.data?.error_message||e?.message||String(e)})}
+});
+
+
+app.get('/api/plaid/transactions-status/:userId', async (req,res)=>{
+  if(!requirePlaid(res))return;
+  try{
+    const items=await getItems(req.params.userId),status=[];
+    for(const item of items){
+      try{
+        const r=await plaid.itemGet({access_token:item.accessToken});
+        status.push({
+          item_id:item.itemId,
+          institution_name:item.institutionName||'Connected institution',
+          billed_products:r.data?.item?.billed_products||[],
+          available_products:r.data?.item?.available_products||[],
+          has_transactions_cursor:Boolean(item.transactionsCursor)
+        });
+      }catch(e){
+        const d=e?.response?.data||{};
+        status.push({item_id:item.itemId,institution_name:item.institutionName||'Connected institution',
+          error_code:d.error_code||'item_status_failed',error_message:d.error_message||e?.message||'Unable to read Item status'});
+      }
+    }
+    res.json({items:status});
+  }catch(e){res.status(500).json({error:'transactions_status_failed',message:e?.message||String(e)})}
 });
 
 const port = Number(process.env.PORT || 8787);
