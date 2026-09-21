@@ -4,7 +4,7 @@ import cors from 'cors';
 import pg from 'pg';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
 
-const APP_VERSION = '3.1.2';
+const APP_VERSION = '3.1.3';
 const app = express();
 
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
@@ -74,6 +74,12 @@ async function initStorage() {
     await pool.query('ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()');
     await pool.query('ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()');
     await pool.query('CREATE INDEX IF NOT EXISTS plaid_items_user_id_idx ON plaid_items(user_id)');
+    await pool.query('ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS transactions_cursor TEXT');
+    await pool.query(`CREATE TABLE IF NOT EXISTS plaid_transactions (
+      user_id TEXT NOT NULL, item_id TEXT NOT NULL, transaction_id TEXT PRIMARY KEY,
+      payload JSONB NOT NULL, removed BOOLEAN DEFAULT FALSE, updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS plaid_transactions_user_idx ON plaid_transactions(user_id)');
 
     await pool.query(`CREATE TABLE IF NOT EXISTS plaid_pending_links (
       user_id TEXT PRIMARY KEY,
@@ -86,7 +92,7 @@ async function initStorage() {
     await pool.query('ALTER TABLE plaid_pending_links ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()');
     await pool.query('ALTER TABLE plaid_pending_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()');
 
-    console.log('PayAviator database schema verified for 9.5.8.');
+    console.log('PayAviator database schema verified for 3.1.3.');
     dbReady = true;
     dbError = null;
     console.log('PayAviator database connected.');
@@ -128,6 +134,7 @@ async function getItems(userId) {
       accessToken: x.access_token,
       institutionId: x.institution_id,
       institutionName: x.institution_name,
+      transactionsCursor: x.transactions_cursor || null,
     }));
   }
   return memory.get(userId) || [];
@@ -481,71 +488,58 @@ app.delete('/api/plaid/items/:userId/:itemId', async (req, res) => {
   }
 });
 
-app.get('/api/plaid/transactions/:userId', async (req, res) => {
-  if (!requirePlaid(res)) return;
-  try {
-    const items = await getItems(req.params.userId);
-    const start_date = req.query.start_date || new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
-    const end_date = req.query.end_date || new Date().toISOString().slice(0, 10);
-    const transactions = [];
-    const errors = [];
 
-    for (const item of items) {
-      try {
-        let offset = 0;
-        let total = Infinity;
-        while (offset < total) {
-          const r = await plaid.transactionsGet({
-            access_token: item.accessToken,
-            start_date,
-            end_date,
-            options: { count: 500, offset },
-          });
-          const batch = Array.isArray(r.data.transactions) ? r.data.transactions : [];
-          total = Number(r.data.total_transactions ?? batch.length);
-          for (const t of batch) {
-            const cp = Array.isArray(t.counterparties) ? t.counterparties.find(x => x?.logo_url || x?.name) : null;
-            transactions.push({
-              ...t,
-              merchant_name: t.merchant_name || cp?.name || t.name || 'Transaction',
-              logo_url: t.logo_url || cp?.logo_url || null,
-              merchant_logo_url: t.logo_url || cp?.logo_url || null,
-              category_icon_url: t.personal_finance_category_icon_url || null,
-              website: t.website || cp?.website || null,
-              item_id: item.itemId,
-              institution_name: item.institutionName || 'Connected institution',
-            });
-          }
-          offset += batch.length;
-          if (!batch.length) break;
+async function setTransactionsCursor(itemId,cursor){
+  if(useDb()) await pool.query('UPDATE plaid_items SET transactions_cursor=$1,updated_at=NOW() WHERE item_id=$2',[cursor||null,itemId]);
+  else for(const [uid,arr] of memory.entries()) memory.set(uid,arr.map(x=>x.itemId===itemId?{...x,transactionsCursor:cursor||null}:x));
+}
+function normalizeTransaction(t,item){
+  const cp=Array.isArray(t.counterparties)?t.counterparties.find(x=>x?.logo_url||x?.name):null;
+  return {...t,merchant_name:t.merchant_name||cp?.name||t.name||'Transaction',
+    logo_url:t.logo_url||cp?.logo_url||null,merchant_logo_url:t.logo_url||cp?.logo_url||null,
+    category_icon_url:t.personal_finance_category_icon_url||null,website:t.website||cp?.website||null,
+    item_id:item.itemId,institution_name:item.institutionName||'Connected institution'};
+}
+async function upsertPlaidTransactions(userId,item,rows){
+  if(useDb()){
+    for(const t of rows) await pool.query(
+      `INSERT INTO plaid_transactions(user_id,item_id,transaction_id,payload,removed,updated_at)
+       VALUES($1,$2,$3,$4::jsonb,FALSE,NOW())
+       ON CONFLICT(transaction_id) DO UPDATE SET payload=EXCLUDED.payload,removed=FALSE,updated_at=NOW()`,
+      [userId,item.itemId,String(t.transaction_id),JSON.stringify(normalizeTransaction(t,item))]);
+  } else { item.transactions=item.transactions||{}; for(const t of rows)item.transactions[String(t.transaction_id)]=normalizeTransaction(t,item); }
+}
+async function removePlaidTransactions(ids){
+  const txids=ids.map(x=>String(x.transaction_id||x)).filter(Boolean); if(!txids.length)return;
+  if(useDb()) await pool.query('UPDATE plaid_transactions SET removed=TRUE,updated_at=NOW() WHERE transaction_id = ANY($1)',[txids]);
+  else for(const arr of memory.values())for(const item of arr)for(const id of txids)if(item.transactions)delete item.transactions[id];
+}
+async function storedTransactions(userId){
+  if(useDb()){const r=await pool.query(`SELECT payload FROM plaid_transactions WHERE user_id=$1 AND removed=FALSE ORDER BY COALESCE(payload->>'datetime',payload->>'date') DESC`,[userId]);return r.rows.map(x=>x.payload)}
+  return (memory.get(userId)||[]).flatMap(i=>Object.values(i.transactions||{}));
+}
+
+app.get('/api/plaid/transactions/:userId', async (req,res)=>{
+  if(!requirePlaid(res))return;
+  try{
+    const userId=req.params.userId,items=await getItems(userId),errors=[],sync=[];
+    for(const item of items){
+      try{
+        let cursor=item.transactionsCursor||null,hasMore=true,addedCount=0,modifiedCount=0,removedCount=0,pages=0;
+        while(hasMore&&pages<100){
+          const request={access_token:item.accessToken,count:500}; if(cursor)request.cursor=cursor;
+          const r=await plaid.transactionsSync(request),d=r.data||{};
+          const added=Array.isArray(d.added)?d.added:[],modified=Array.isArray(d.modified)?d.modified:[],removed=Array.isArray(d.removed)?d.removed:[];
+          await upsertPlaidTransactions(userId,item,[...added,...modified]); await removePlaidTransactions(removed);
+          addedCount+=added.length;modifiedCount+=modified.length;removedCount+=removed.length;
+          cursor=d.next_cursor||cursor;hasMore=Boolean(d.has_more);pages++;
         }
-      } catch (e) {
-        const d = e?.response?.data || {};
-        console.error('transactions item failed', item.itemId, d || e);
-        errors.push({
-          item_id: item.itemId,
-          institution_name: item.institutionName || 'Connected institution',
-          code: d.error_code || 'transactions_item_failed',
-          message: d.error_message || e?.message || 'Transaction retrieval failed',
-        });
-      }
+        await setTransactionsCursor(item.itemId,cursor);
+        sync.push({item_id:item.itemId,institution_name:item.institutionName||'Connected institution',added:addedCount,modified:modifiedCount,removed:removedCount,pages});
+      }catch(e){const d=e?.response?.data||{};console.error('transactions sync item failed',item.itemId,d||e);errors.push({item_id:item.itemId,institution_name:item.institutionName||'Connected institution',code:d.error_code||'transactions_sync_failed',message:d.error_message||e?.message||'Transaction sync failed'})}
     }
-
-    const deduped = [...new Map(transactions.map(t => [
-      String(t.transaction_id || [t.account_id, t.date, t.authorized_date, t.merchant_name || t.name, t.amount].join('|')),
-      t
-    ])).values()].sort((a,b) => String(b.datetime || b.date || '').localeCompare(String(a.datetime || a.date || '')));
-
-    res.json({
-      transactions: deduped,
-      fetched_at: new Date().toISOString(),
-      start_date,
-      end_date,
-      errors,
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'transactions_failed', message: e?.message || String(e) });
-  }
+    res.json({transactions:await storedTransactions(userId),fetched_at:new Date().toISOString(),sync,errors});
+  }catch(e){console.error('transactions sync failed',e?.response?.data||e);res.status(500).json({error:'transactions_sync_failed',message:e?.response?.data?.error_message||e?.message||String(e)})}
 });
 
 const port = Number(process.env.PORT || 8787);
