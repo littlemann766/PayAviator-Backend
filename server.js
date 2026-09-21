@@ -4,7 +4,7 @@ import cors from 'cors';
 import pg from 'pg';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
 
-const APP_VERSION = '3.1.4';
+const APP_VERSION = '3.1.5';
 const app = express();
 
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
@@ -514,9 +514,19 @@ async function removePlaidTransactions(ids){
   if(useDb()) await pool.query('UPDATE plaid_transactions SET removed=TRUE,updated_at=NOW() WHERE transaction_id = ANY($1)',[txids]);
   else for(const arr of memory.values())for(const item of arr)for(const id of txids)if(item.transactions)delete item.transactions[id];
 }
-async function storedTransactions(userId){
-  if(useDb()){const r=await pool.query(`SELECT payload FROM plaid_transactions WHERE user_id=$1 AND removed=FALSE ORDER BY COALESCE(payload->>'datetime',payload->>'date') DESC`,[userId]);return r.rows.map(x=>x.payload)}
-  return (memory.get(userId)||[]).flatMap(i=>Object.values(i.transactions||{}));
+async function storedTransactions(userId, limit=250){
+  const safeLimit=Math.max(1,Math.min(Number(limit)||250,500));
+  if(useDb()){
+    const r=await pool.query(
+      `SELECT payload FROM plaid_transactions
+       WHERE user_id=$1 AND removed=FALSE
+       ORDER BY COALESCE(payload->>'datetime',payload->>'date') DESC
+       LIMIT $2`,[userId,safeLimit]);
+    return r.rows.map(x=>x.payload);
+  }
+  return (memory.get(userId)||[]).flatMap(i=>Object.values(i.transactions||{}))
+    .sort((a,b)=>String(b.datetime||b.date||'').localeCompare(String(a.datetime||a.date||'')))
+    .slice(0,safeLimit);
 }
 
 app.get('/api/plaid/transactions/:userId', async (req,res)=>{
@@ -538,7 +548,7 @@ app.get('/api/plaid/transactions/:userId', async (req,res)=>{
         sync.push({item_id:item.itemId,institution_name:item.institutionName||'Connected institution',added:addedCount,modified:modifiedCount,removed:removedCount,pages});
       }catch(e){const d=e?.response?.data||{};console.error('transactions sync item failed',item.itemId,d||e);errors.push({item_id:item.itemId,institution_name:item.institutionName||'Connected institution',code:d.error_code||'transactions_sync_failed',message:d.error_message||e?.message||'Transaction sync failed'})}
     }
-    res.json({transactions:await storedTransactions(userId),fetched_at:new Date().toISOString(),sync,errors});
+    res.json({transactions:await storedTransactions(userId,req.query.limit||250),fetched_at:new Date().toISOString(),sync,errors});
   }catch(e){console.error('transactions sync failed',e?.response?.data||e);res.status(500).json({error:'transactions_sync_failed',message:e?.response?.data?.error_message||e?.message||String(e)})}
 });
 
