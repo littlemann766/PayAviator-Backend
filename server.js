@@ -4,7 +4,7 @@ import cors from 'cors';
 import pg from 'pg';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
 
-const APP_VERSION = '3.0.3';
+const APP_VERSION = '3.1.2';
 const app = express();
 
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
@@ -390,6 +390,22 @@ app.post('/api/plaid/exchange-public-token', async (req, res) => {
   }
 });
 
+
+function physicalAccountKey(a, institutionName = '') {
+  const norm = v => String(v || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const mask = norm(a?.mask);
+  const type = norm(a?.type);
+  const subtype = norm(a?.subtype);
+  const name = norm(a?.official_name || a?.name);
+  const institution = norm(institutionName || a?.institution_name || a?.institution);
+  // Institution + last four + account class identifies the same physical account
+  // across duplicate Plaid Items/reconnections. Fall back to Plaid account_id only
+  // when a mask is unavailable.
+  return mask
+    ? [institution, mask, type, subtype, name].join('|')
+    : String(a?.account_id || a?.id || [institution,type,subtype,name].join('|'));
+}
+
 app.get('/api/plaid/accounts/:userId', async (req, res) => {
   if (!requirePlaid(res)) return;
   try {
@@ -436,8 +452,12 @@ app.get('/api/plaid/accounts/:userId', async (req, res) => {
         console.error('accounts item failed', item.itemId, e.response?.data || e);
       }
     }
+    const uniqueAccounts = [...new Map(accounts.map(a => [
+      physicalAccountKey(a, a.institution_name),
+      a
+    ])).values()];
     res.json({
-      accounts,
+      accounts: uniqueAccounts,
       items: items.map(i => ({ item_id: i.itemId, institution_id: i.institutionId, institution_name: i.institutionName })),
     });
   } catch (e) {
@@ -468,27 +488,63 @@ app.get('/api/plaid/transactions/:userId', async (req, res) => {
     const start_date = req.query.start_date || new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
     const end_date = req.query.end_date || new Date().toISOString().slice(0, 10);
     const transactions = [];
+    const errors = [];
+
     for (const item of items) {
       try {
-        const r = await plaid.transactionsGet({
-          access_token: item.accessToken,
-          start_date,
-          end_date,
-          options: { count: 250, offset: 0 },
-        });
-        transactions.push(...r.data.transactions.map(t => ({
-          ...t,
+        let offset = 0;
+        let total = Infinity;
+        while (offset < total) {
+          const r = await plaid.transactionsGet({
+            access_token: item.accessToken,
+            start_date,
+            end_date,
+            options: { count: 500, offset },
+          });
+          const batch = Array.isArray(r.data.transactions) ? r.data.transactions : [];
+          total = Number(r.data.total_transactions ?? batch.length);
+          for (const t of batch) {
+            const cp = Array.isArray(t.counterparties) ? t.counterparties.find(x => x?.logo_url || x?.name) : null;
+            transactions.push({
+              ...t,
+              merchant_name: t.merchant_name || cp?.name || t.name || 'Transaction',
+              logo_url: t.logo_url || cp?.logo_url || null,
+              merchant_logo_url: t.logo_url || cp?.logo_url || null,
+              category_icon_url: t.personal_finance_category_icon_url || null,
+              website: t.website || cp?.website || null,
+              item_id: item.itemId,
+              institution_name: item.institutionName || 'Connected institution',
+            });
+          }
+          offset += batch.length;
+          if (!batch.length) break;
+        }
+      } catch (e) {
+        const d = e?.response?.data || {};
+        console.error('transactions item failed', item.itemId, d || e);
+        errors.push({
           item_id: item.itemId,
           institution_name: item.institutionName || 'Connected institution',
-        })));
-      } catch (e) {
-        console.error('transactions item failed', item.itemId, e.response?.data || e);
+          code: d.error_code || 'transactions_item_failed',
+          message: d.error_message || e?.message || 'Transaction retrieval failed',
+        });
       }
     }
-    const deduped = [...new Map(transactions.map(t => [String(t.transaction_id || [t.item_id, t.account_id, t.date, t.name, t.amount].join('|')), t])).values()];
-    res.json({ transactions: deduped, fetched_at: new Date().toISOString() });
+
+    const deduped = [...new Map(transactions.map(t => [
+      String(t.transaction_id || [t.account_id, t.date, t.authorized_date, t.merchant_name || t.name, t.amount].join('|')),
+      t
+    ])).values()].sort((a,b) => String(b.datetime || b.date || '').localeCompare(String(a.datetime || a.date || '')));
+
+    res.json({
+      transactions: deduped,
+      fetched_at: new Date().toISOString(),
+      start_date,
+      end_date,
+      errors,
+    });
   } catch (e) {
-    res.status(500).json({ error: 'transactions_failed' });
+    res.status(500).json({ error: 'transactions_failed', message: e?.message || String(e) });
   }
 });
 
