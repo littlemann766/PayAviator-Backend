@@ -51,3 +51,22 @@ test('CORS only reflects allowlisted origins and allows Authorization', async ()
   const evil = await request(app).options('/api/plaid/accounts').set('Origin', 'https://evil.example').set('Access-Control-Request-Method', 'GET');
   assert.equal(evil.headers['access-control-allow-origin'], undefined);
 });
+
+test('requireAuth parses the Bearer header strictly and in linear time', async () => {
+  const { requireAuth } = await import('../src/auth.js');
+  const seen = [];
+  const mw = requireAuth(async (tok) => { seen.push(tok); return { userId: 'u1', claims: {} }; });
+  const run = (h) => new Promise((resolve) => {
+    const req = { get: (n) => (n.toLowerCase() === 'authorization' ? h : undefined), path: '/x' };
+    const res = { set() { return this; }, status(c) { resolve(c); return this; }, json() { return this; } };
+    mw(req, res, () => resolve(200));
+  });
+  assert.equal(await run('Bearer abc.def-ghi_'), 200);
+  assert.equal(await run('bearer   tok  '), 200);
+  assert.deepEqual(seen, ['abc.def-ghi_', 'tok']);
+  assert.equal(await run('Bearer a b'), 401);
+  assert.equal(await run(''), 401);
+  const t = Date.now();
+  assert.equal(await run('bearer ' + ' '.repeat(100000) + 'x\n'), 401);
+  assert.ok(Date.now() - t < 200, 'pathological header must not be slow');
+});

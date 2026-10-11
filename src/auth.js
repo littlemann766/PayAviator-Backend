@@ -46,13 +46,14 @@ export function requireAuth(verifier, { log, devUserHeader = 'x-dev-user-id' } =
   }
   return async (req, res, next) => {
     const header = req.get('authorization') || '';
-    const match = /^Bearer\s+(.+)$/i.exec(header);
+    // Unambiguous pattern (token has no whitespace), so it runs in linear time.
+    const match = /^Bearer[ \t]+(\S+)[ \t]*$/i.exec(header);
     if (!match) {
       res.set('WWW-Authenticate', 'Bearer');
       return res.status(401).json({ error: 'Authentication required.', code: 'UNAUTHENTICATED' });
     }
     try {
-      const { userId, claims } = await verifier(match[1].trim());
+      const { userId, claims } = await verifier(match[1]);
       req.userId = userId;
       req.authClaims = claims;
       next();
