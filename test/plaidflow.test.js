@@ -109,3 +109,36 @@ test('withRetry retries 429/5xx but not item errors', async () => {
   await assert.rejects(withRetry(async () => { m++; throw plaidErr(400, 'ITEM_LOGIN_REQUIRED', 'ITEM_ERROR'); }, { sleep: async () => {} }));
   assert.equal(m, 1);
 });
+
+test('DELETE /api/plaid/user removes items at Plaid and deletes all user rows; keeps failed items', async () => {
+  const plaid = fakePlaid({ itemRemove: async ({ access_token }) => { if (access_token === 'access-sandbox-bad') throw plaidErr(500, 'INTERNAL_SERVER_ERROR'); return {}; } });
+  const { app, store } = buildApp({ plaid });
+  await store.putItem({ userId: 'user-1', itemId: 'ok-1', accessToken: 'access-sandbox-ok' });
+  await store.putItem({ userId: 'user-1', itemId: 'bad-1', accessToken: 'access-sandbox-bad' });
+  await store.putItem({ userId: 'user-2', itemId: 'other', accessToken: 'access-sandbox-other' });
+  await store.applySync('user-1', { itemId: 'ok-1' }, { upserts: [{ transaction_id: 't-ok', date: '2026-01-01' }], removedIds: [], cursor: 'c' });
+  await store.applySync('user-1', { itemId: 'bad-1' }, { upserts: [{ transaction_id: 't-bad', date: '2026-01-01' }], removedIds: [], cursor: 'c' });
+  await store.markExchanged('h-ok', 'user-1', 'ok-1');
+  await store.markExchanged('h-bad', 'user-1', 'bad-1');
+  await store.putPending('user-1', 'link-x');
+
+  const r1 = await request(app).delete('/api/plaid/user').set('Authorization', await bearer());
+  assert.equal(r1.status, 502);
+  assert.deepEqual(r1.body.failed_item_ids, ['bad-1']);
+  assert.deepEqual((await store.getItems('user-1')).map(i => i.itemId), ['bad-1']);
+  assert.deepEqual((await store.storedTransactions('user-1')).map(t => t.transaction_id), ['t-bad']);
+  assert.equal(await store.getExchanged('h-ok'), null);
+  assert.ok(await store.getExchanged('h-bad'));
+  assert.equal(await store.getPending('user-1'), null);
+
+  plaid.calls.length = 0;
+  const handlers = { itemRemove: async () => ({}) };
+  const plaid2 = fakePlaid(handlers);
+  const { app: app2 } = buildApp({ plaid: plaid2, store });
+  const r2 = await request(app2).delete('/api/plaid/user').set('Authorization', await bearer());
+  assert.equal(r2.status, 200);
+  assert.equal((await store.getItems('user-1')).length, 0);
+  assert.equal((await store.storedTransactions('user-1')).length, 0);
+  assert.equal(await store.getExchanged('h-bad'), null);
+  assert.equal((await store.getItems('user-2')).length, 1, 'other users untouched');
+});

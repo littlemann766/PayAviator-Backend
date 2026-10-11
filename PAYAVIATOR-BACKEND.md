@@ -56,7 +56,7 @@ Authenticated (`Authorization: Bearer ...`). Legacy `/:userId` variants still wo
 | `GET /api/plaid/transactions?limit=250&refresh=1` | Syncs (unless `refresh=0`) and returns stored transactions + per-item `errors`. |
 | `GET /api/plaid/transactions-status` | Per-item Plaid product status. |
 | `DELETE /api/plaid/items/:itemId` | Disconnects (calls `/item/remove`, deletes the item's transactions). |
-| `DELETE /api/plaid/user` | Account deletion: removes every Item at Plaid and all stored data. |
+| `DELETE /api/plaid/user` | Account deletion: removes every Item at Plaid, then deletes the user's items, transactions, pending links and exchanged-token rows in one DB transaction. Items whose removal failed are kept (502 + `failed_item_ids`) so the call can be retried. |
 
 ## Android app changes required (breaking)
 1. **Send `Authorization: Bearer <ID token>` on every `/api/plaid/*` call** (e.g. Firebase `user.getIdToken()`, refreshed when it expires). Unauthenticated calls get `401 {code: "UNAUTHENTICATED" | "INVALID_TOKEN"}`; on 401 refresh the token once, then sign the user in again.
@@ -65,3 +65,29 @@ Authenticated (`Authorization: Bearer ...`). Legacy `/:userId` variants still wo
 3. Handle item health: in `GET /api/plaid/accounts`, for each `items[]` entry with `needs_update: true` show "Reconnect", call `POST /api/plaid/update-link-token {item_id}`, open the returned `hosted_link_url`, then poll `GET /api/plaid/hosted-status` until `status` is `success` / `exited` / `failed`. `errors[]` in the accounts and transactions responses carry `code` + `needs_update`.
 4. Show `error` from error responses to users (it is Plaid's `display_message` or a generic message); log `request_id` for support.
 5. Call `DELETE /api/plaid/user` when a user deletes their PayAviator account.
+
+## Post-3.9.7 step: remove legacy (pre-Firebase) bank links
+App versions before 3.9.7 stored banks under self-generated IDs (`pp-…`, `ppd_…`). After the Firebase sign-in build is live and
+users have relinked, remove those orphaned Plaid Items. Otherwise they stay billed and their data stays stored.
+
+`scripts/cleanup-legacy-items.js` treats any `user_id` that is not a Firebase uid (20-128 alphanumeric characters) as legacy.
+It uses the same environment variables as the server. Run it inside the Railway service so the private database host resolves:
+
+```bash
+railway ssh --service PayAviator-Backend          # or the dashboard's shell
+node scripts/cleanup-legacy-items.js              # dry run (default): prints counts only
+node scripts/cleanup-legacy-items.js --apply      # /item/remove each legacy Item, then delete items,
+                                                  # transactions, pending links, exchanged-token rows
+```
+
+Output is counts plus, for failures, `item_id` + Plaid `error_code`/`request_id` (never tokens). Items whose `/item/remove`
+fails are kept and can be retried by re-running `--apply`. It's safe to re-run.
+
+## Logging and retention
+Server logs are JSON lines on stdout/stderr, captured by Railway. They contain only: message, Firebase `user_id`, Plaid `item_id`,
+Plaid `request_id`, `error_type` / `error_code` / HTTP status, webhook type/code, and counts.
+They never contain access/public/link tokens, the Plaid secret, Authorization headers or ID tokens, or transaction/account/balance payloads.
+`src/log.js` also redacts token- and JWT-shaped strings and drops payload-type fields as a backstop. Malformed-request errors (4xx) log only
+their type, not the message, because parser messages can echo the request body.
+Railway retains these logs for the period of the workspace's plan (see Railway's pricing/plan docs). Mention this in the privacy
+policy's "service providers / logs" section.

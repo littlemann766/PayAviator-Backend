@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import pg from 'pg';
 import { PgStore } from '../src/store.js';
-import { isEncrypted } from '../src/crypto.js';
+import { isEncrypted, encryptToken } from '../src/crypto.js';
+import { cleanupLegacyItems } from '../src/legacy.js';
 
 const url = process.env.TEST_DATABASE_URL;
 
@@ -48,5 +49,48 @@ test('PgStore: legacy plaintext migration is idempotent; CRUD works', { skip: !u
   await store.deleteItem('u1', 'i2');
   assert.equal(await store.getItemById('i2'), null);
   assert.equal((await raw.query(`SELECT count(*)::int n FROM plaid_transactions WHERE item_id='i2'`)).rows[0].n, 0);
+  await store.close(); await raw.end();
+});
+
+test('PgStore.deleteUserData and legacy cleanup', { skip: !url && 'TEST_DATABASE_URL not set' }, async () => {
+  const key = crypto.randomBytes(32);
+  const raw = new pg.Pool({ connectionString: url });
+  await raw.query('DROP TABLE IF EXISTS plaid_items, plaid_transactions, plaid_pending_links, plaid_exchanged_public_tokens');
+  const store = new PgStore({ url, ssl: false }, key);
+  await store.init();
+  const fb = 'kX3vT9qLmN2pR7sW1yZ4bC6dE8fG';
+  // deleteUserData keeps listed items
+  await store.putItem({ userId: fb, itemId: 'a', accessToken: 'access-sandbox-a' });
+  await store.putItem({ userId: fb, itemId: 'b', accessToken: 'access-sandbox-b' });
+  await store.applySync(fb, { itemId: 'a' }, { upserts: [{ transaction_id: 'ta' }], removedIds: [], cursor: 'c' });
+  await store.markExchanged('ha', fb, 'a'); await store.markExchanged('hb', fb, 'b');
+  await store.putPending(fb, 'link-1');
+  await store.deleteUserData(fb, { keepItemIds: ['b'] });
+  assert.deepEqual((await store.getItems(fb)).map(i => i.itemId), ['b']);
+  assert.equal((await store.storedTransactions(fb)).length, 0);
+  assert.equal(await store.getExchanged('ha'), null);
+  assert.ok(await store.getExchanged('hb'));
+  assert.equal(await store.getPending(fb), null);
+
+  // legacy cleanup
+  await store.putItem({ userId: 'pp-old-1', itemId: 'L1', accessToken: 'access-sandbox-L1' });
+  await store.putItem({ userId: 'ppd_OldDeviceId12345678', itemId: 'L2', accessToken: 'access-sandbox-L2' });
+  await store.applySync('pp-old-1', { itemId: 'L1' }, { upserts: [{ transaction_id: 'tL1' }], removedIds: [], cursor: 'c' });
+  await store.markExchanged('hL1', 'pp-old-1', 'L1');
+  await store.putPending('pp-old-1', 'link-old');
+  const removed = [];
+  const plaid = { call: async (m, req) => { removed.push(req.access_token); if (req.access_token === 'access-sandbox-L2') throw Object.assign(new Error('gone'), { response: { data: { error_code: 'ITEM_NOT_FOUND' } } }); return {}; } };
+  const dry = await cleanupLegacyItems({ pool: raw, plaid, key });
+  assert.equal(dry.mode, 'dry-run'); assert.equal(dry.legacy_items, 2); assert.equal(dry.firebase_items_kept, 1);
+  assert.equal(removed.length, 0, 'dry run calls nothing');
+  assert.ok(!JSON.stringify(dry).includes('access-'));
+  const res = await cleanupLegacyItems({ pool: raw, plaid, key, apply: true });
+  assert.ok(!JSON.stringify(res).includes('access-'));
+  assert.equal(res.items_deleted, 2); assert.equal(res.removed_at_plaid, 1); assert.equal(res.already_gone_at_plaid, 1);
+  assert.deepEqual(removed.sort(), ['access-sandbox-L1', 'access-sandbox-L2']);
+  const left = (await raw.query('SELECT user_id FROM plaid_items')).rows.map(r => r.user_id);
+  assert.deepEqual(left, [fb]);
+  for (const t of ['plaid_transactions', 'plaid_pending_links']) assert.equal((await raw.query(`SELECT count(*)::int n FROM ${t} WHERE user_id LIKE 'pp%'`)).rows[0].n, 0);
+  assert.equal(await store.getExchanged('hL1'), null);
   await store.close(); await raw.end();
 });

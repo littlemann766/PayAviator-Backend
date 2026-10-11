@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && for f in src/*.js; do node --check \"$f\" || exit 1; done",
-    "test": "node --test test/"
+    "check": "node --check server.js && for f in src/*.js scripts/*.js; do node --check \"$f\" || exit 1; done",
+    "test": "node --test test/",
+    "cleanup:legacy": "node scripts/cleanup-legacy-items.js"
   },
   "dependencies": {
     "cors": "^2.8.6",

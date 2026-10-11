@@ -313,15 +313,19 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     }
   });
 
-  async function removeItem(userId, item) {
+  /** Calls /item/remove; "already gone" at Plaid counts as removed. Throws on other errors. */
+  async function removeAtPlaid(item) {
     try {
       await plaid.call('itemRemove', { access_token: item.accessToken });
     } catch (e) {
       const code = e?.response?.data?.error_code;
-      // Already gone at Plaid: safe to delete locally.
       if (!['ITEM_NOT_FOUND', 'INVALID_ACCESS_TOKEN'].includes(code)) throw e;
       log.warn('item already removed at Plaid', { item_id: item.itemId, ...plaidErrorInfo(e) });
     }
+  }
+
+  async function removeItem(userId, item) {
+    await removeAtPlaid(item);
     await store.deleteItem(userId, item.itemId); // also deletes its transactions
     log.info('item removed', { user_id: userId, item_id: item.itemId });
   }
@@ -338,16 +342,24 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     }
   });
 
-  // Account deletion: removes every Item at Plaid and all stored data for the user.
+  // Account deletion: removes every Item at Plaid, then deletes all of the user's stored data
+  // (items, transactions, pending links, exchanged-token rows) in one DB transaction.
+  // Items whose /item/remove failed are kept (with their rows) so the call can be retried.
   api.delete('/plaid/user', async (req, res) => {
-    const items = await store.getItems(req.userId);
-    const failed = [];
-    for (const item of items) {
-      try { await removeItem(req.userId, item); }
-      catch (e) { log.error('item remove failed', { item_id: item.itemId, ...plaidErrorInfo(e) }); failed.push(item.itemId); }
+    try {
+      const items = await store.getItems(req.userId);
+      const failed = [];
+      for (const item of items) {
+        try { await removeAtPlaid(item); }
+        catch (e) { log.error('item remove failed', { item_id: item.itemId, ...plaidErrorInfo(e) }); failed.push(item.itemId); }
+      }
+      await store.deleteUserData(req.userId, { keepItemIds: failed });
+      log.info('user data deleted', { user_id: req.userId, removed: items.length - failed.length, failed: failed.length });
+      res.status(failed.length ? 502 : 200).json({ removed: items.length - failed.length, failed_item_ids: failed });
+    } catch (e) {
+      log.error('user deletion failed', { user_id: req.userId, ...plaidErrorInfo(e) });
+      res.status(500).json({ error: 'Could not delete account data. Please try again.', code: 'USER_DELETE_FAILED' });
     }
-    await store.clearPending(req.userId);
-    res.status(failed.length ? 502 : 200).json({ removed: items.length - failed.length, failed_item_ids: failed });
   });
 
   api.get(['/plaid/transactions', '/plaid/transactions/:userId'], enforceUserMatch, async (req, res) => {
@@ -397,8 +409,9 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   app.use((_req, res) => res.status(404).json({ error: 'Not found.', code: 'NOT_FOUND' }));
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => {
-    log.error('unhandled error', { error_message: err?.message, type: err?.type });
     const status = err?.status || err?.statusCode || 500;
+    // 4xx (e.g. malformed JSON) messages can echo request body fragments: log only the type.
+    log.error('unhandled error', { type: err?.type || err?.name, status, ...(status >= 500 ? { error_message: err?.message } : {}) });
     res.status(status >= 400 && status < 600 ? status : 500).json({ error: status < 500 ? 'Bad request.' : 'Internal error.', code: status < 500 ? 'BAD_REQUEST' : 'INTERNAL' });
   });
 

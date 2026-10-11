@@ -1,8 +1,31 @@
-// Minimal structured (JSON lines) logger. Never pass access tokens, public
-// tokens, secrets or full axios errors in fields: axios errors carry request
-// headers, which include PLAID-SECRET.
+// Minimal structured (JSON lines) logger.
+// What server logs contain: message, user_id (Firebase uid), item_id, Plaid request_id,
+// error_type/error_code/HTTP status, webhook type/code, counts. Never access/public/link
+// tokens, secrets, Authorization headers, or transaction/account payloads.
+// Call sites must pass only such fields; redact() below is a defense-in-depth backstop.
+
+const REDACTIONS = [
+  [/\b(access|public|link)-(sandbox|production|development)-[A-Za-z0-9-]+/g, '$1-$2-[REDACTED]'],
+  [/enc:v1:[A-Za-z0-9+/=:]+/g, 'enc:v1:[REDACTED]'],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]'],
+  [/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g, '[REDACTED_JWT]'],
+];
+
+// Keys whose values are never logged, whatever they contain.
+const BLOCKED_KEYS = new Set(['access_token', 'accessToken', 'public_token', 'link_token', 'secret', 'authorization',
+  'transactions', 'added', 'modified', 'payload', 'accounts', 'balances', 'body', 'config', 'headers']);
+
+export function redact(value, depth = 0) {
+  if (typeof value === 'string') return REDACTIONS.reduce((s, [re, rep]) => s.replace(re, rep), value);
+  if (value === null || typeof value !== 'object' || depth > 4) return value;
+  if (Array.isArray(value)) return value.map(v => redact(v, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) out[k] = BLOCKED_KEYS.has(k) ? '[REDACTED]' : redact(v, depth + 1);
+  return out;
+}
+
 function emit(level, msg, fields = {}) {
-  const line = JSON.stringify({ ts: new Date().toISOString(), level, msg, ...fields });
+  const line = JSON.stringify({ ts: new Date().toISOString(), level, msg: redact(String(msg)), ...redact(fields) });
   if (level === 'error' || level === 'warn') console.error(line);
   else console.log(line);
 }
