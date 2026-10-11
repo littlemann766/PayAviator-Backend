@@ -10,7 +10,7 @@ const app = express();
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
 // can have a different origin. The API contains no browser cookies, so allowing the
 // requesting origin is appropriate here and keeps Android WebView preflights simple.
-app.use(cors({ origin: true, methods: ['GET', 'POST', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Accept'] }));
+app.use(cors({ origin: true, methods: ['GET', 'POST', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Accept', 'Authorization'] }));
 app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
