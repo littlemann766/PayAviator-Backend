@@ -39,7 +39,14 @@ Transactions returned to the app are history/information. The app uses live incl
    | `FIREBASE_PROJECT_ID` **or** `AUTH_JWKS_URL` + `AUTH_JWT_ISSUER` + `AUTH_JWT_AUDIENCE` **or** `APP_JWT_SECRET` | your auth provider |
    | `CORS_ORIGINS` | `https://appassets.androidplatform.net` plus any PWA origin |
 
+   | `DATABASE_SSL_REJECT_UNAUTHORIZED` | Leave **unset** (defaults to `true` in production). `false` disables certificate checks and logs a `!!!` warning at boot. |
+
    Do not put `sslmode=` in `DATABASE_URL`; TLS is controlled by the variables above.
+
+   Migrating from the old single-file server: it ignored `DATABASE_SSL_REJECT_UNAUTHORIZED` and always connected with TLS
+   verification off. This version honors it, so before merging check the Railway service: with `DATABASE_URL` on
+   `*.railway.internal`, set `PGSSL=disable` and delete `DATABASE_SSL_REJECT_UNAUTHORIZED`; with a public/proxy host, set
+   `DATABASE_SSL_CA` (Railway's Postgres certificate is self-signed, so verification without a CA makes startup fail).
 3. Deploy (`npm ci && npm start`; Railpack installs Node 24 from `engines.node`). Check the logs for `database ready` and any `!!!` warnings, then `GET /api/health`.
 4. In Sandbox first: link a Sandbox institution, then fire test webhooks with `/sandbox/item/fire_webhook` and test update mode with `/sandbox/item/reset_login`.
 5. Switch to Production only by changing `PLAID_ENV` + `PLAID_SECRET`. Sandbox Items do not work in Production; users relink.

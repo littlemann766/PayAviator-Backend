@@ -64,3 +64,19 @@ test('days_requested is validated and DB TLS escape hatch warns', () => {
 test('non-https webhook URL rejected', () => {
   assert.throws(() => loadConfig({ ...prodEnv, PLAID_WEBHOOK_URL: 'http://insecure.example.com/hook' }), /https/);
 });
+
+test('DB TLS: certificate verification defaults to on in production when DATABASE_SSL_REJECT_UNAUTHORIZED is unset or empty', () => {
+  for (const v of [undefined, '', 'true', '1', 'yes']) {
+    const env = { ...prodEnv };
+    if (v !== undefined) env.DATABASE_SSL_REJECT_UNAUTHORIZED = v;
+    const { config, warnings } = loadConfig(env);
+    assert.equal(config.db.ssl.rejectUnauthorized, true, `value ${JSON.stringify(v)}`);
+    assert.ok(!warnings.some(w => /NOT verified/.test(w)));
+  }
+  // With a pinned CA, verification stays on unless explicitly disabled.
+  const ca = Buffer.from('-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----').toString('base64');
+  assert.equal(loadConfig({ ...prodEnv, DATABASE_SSL_CA: ca }).config.db.ssl.rejectUnauthorized, true);
+  assert.match(loadConfig({ ...prodEnv, DATABASE_SSL_CA: ca }).config.db.ssl.ca, /BEGIN CERTIFICATE/);
+  // PGSSL=disable turns TLS off entirely (only intended for *.railway.internal).
+  assert.equal(loadConfig({ ...prodEnv, PGSSL: 'disable', DATABASE_URL: 'postgres://u:p@postgres.railway.internal:5432/railway' }).config.db.ssl, false);
+});
