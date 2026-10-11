@@ -197,7 +197,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     const d = await plaid.call('itemGet', { access_token: item.accessToken });
     const err = d?.item?.error;
     if (err && err.error_code) {
-      await store.setItemStatus(itemId, statusForItemError(err.error_code), err.error_code);
+      await store.setItemStatus(itemId, statusForItemError(err.error_code, err.error_code_reason), err.error_code);
       return { ok: false, status: 409, body: { error: err.display_message || 'This bank still needs attention.', code: err.error_code } };
     }
     await store.setItemStatus(itemId, ITEM_STATUS.GOOD, null);
@@ -300,7 +300,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
           for (const a of d.accounts) accounts.push(decorateAccount(a, item));
         } catch (e) {
           const code = itemErrorCode(e);
-          if (code) { item.status = statusForItemError(code); item.errorCode = code; await store.setItemStatus(item.itemId, item.status, code); }
+          if (code) { item.status = statusForItemError(code, e?.response?.data?.error_code_reason); item.errorCode = code; await store.setItemStatus(item.itemId, item.status, code); }
           log.error('accounts get failed', { item_id: item.itemId, ...plaidErrorInfo(e) });
           errors.push({ item_id: item.itemId, code: code || 'ACCOUNTS_FAILED', needs_update: Boolean(code && item.status === ITEM_STATUS.LOGIN_REQUIRED) });
         }

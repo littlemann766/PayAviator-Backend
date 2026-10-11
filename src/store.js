@@ -146,8 +146,34 @@ export class PgStore {
   }
 
   async setItemStatus(itemId, status, errorCode = null) {
+    if (status === ITEM_STATUS.REVOKED) return this.revokeItem(itemId, errorCode);
     await this.pool.query('UPDATE plaid_items SET status=$1, error_code=$2, status_updated_at=NOW(), updated_at=NOW() WHERE item_id=$3',
       [status, errorCode, itemId]);
+  }
+
+  /**
+   * User revoked consent: in one DB transaction delete the Item's transactions, exchanged-token hashes and any
+   * pending update-mode link for it, reset its sync cursor, and mark it revoked. Only the minimal Item row
+   * (ids, institution, status, encrypted access token for update mode) is kept so the app can offer "Reconnect";
+   * a successful reconnect re-syncs from scratch because the cursor is cleared.
+   */
+  async revokeItem(itemId, errorCode = 'USER_PERMISSION_REVOKED') {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Lock the Item row first so a concurrent applySync cannot re-insert rows after the purge.
+      await client.query('SELECT 1 FROM plaid_items WHERE item_id=$1 FOR UPDATE', [itemId]);
+      await client.query('DELETE FROM plaid_transactions WHERE item_id=$1', [itemId]);
+      await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE item_id=$1', [itemId]);
+      await client.query('DELETE FROM plaid_pending_links WHERE item_id=$1', [itemId]);
+      await client.query(
+        `UPDATE plaid_items SET status=$1, error_code=$2, transactions_cursor=NULL, new_accounts_available=FALSE,
+           status_updated_at=NOW(), updated_at=NOW() WHERE item_id=$3`, [ITEM_STATUS.REVOKED, errorCode, itemId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { client.release(); }
   }
 
   async setNewAccountsAvailable(itemId, value) {
@@ -159,6 +185,9 @@ export class PgStore {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // Serialize with revokeItem/deleteItem: never write transactions for a revoked or deleted Item.
+      const cur = await client.query('SELECT status FROM plaid_items WHERE item_id=$1 FOR UPDATE', [item.itemId]);
+      if (!cur.rows[0] || cur.rows[0].status === ITEM_STATUS.REVOKED) { await client.query('ROLLBACK'); return false; }
       for (const t of upserts) {
         await client.query(
           `INSERT INTO plaid_transactions(user_id,item_id,transaction_id,payload,removed,updated_at)
@@ -172,6 +201,7 @@ export class PgStore {
       }
       await client.query('UPDATE plaid_items SET transactions_cursor=$1,updated_at=NOW() WHERE item_id=$2', [cursor || null, item.itemId]);
       await client.query('COMMIT');
+      return true;
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
       throw e;
@@ -256,13 +286,24 @@ export class MemoryStore {
     this.pending.delete(userId);
   }
   async setItemStatus(itemId, status, errorCode = null) {
+    if (status === ITEM_STATUS.REVOKED) return this.revokeItem(itemId, errorCode);
     const x = this.items.get(itemId); if (x) Object.assign(x, { status, error_code: errorCode, status_updated_at: new Date() });
+  }
+  async revokeItem(itemId, errorCode = 'USER_PERMISSION_REVOKED') {
+    for (const [id, t] of this.transactions) if (t.itemId === itemId) this.transactions.delete(id);
+    for (const [h, x] of this.exchanged) if (x.itemId === itemId) this.exchanged.delete(h);
+    for (const [u, p] of this.pending) if (p.itemId === itemId) this.pending.delete(u);
+    const x = this.items.get(itemId);
+    if (x) Object.assign(x, { status: ITEM_STATUS.REVOKED, error_code: errorCode, transactions_cursor: null, new_accounts_available: false, status_updated_at: new Date() });
   }
   async setNewAccountsAvailable(itemId, value) { const x = this.items.get(itemId); if (x) x.new_accounts_available = Boolean(value); }
   async applySync(userId, item, { upserts, removedIds, cursor }) {
+    const row = this.items.get(item.itemId);
+    if (!row || row.status === ITEM_STATUS.REVOKED) return false;
     for (const t of upserts) this.transactions.set(String(t.transaction_id), { userId, itemId: item.itemId, payload: t, removed: false });
     for (const id of removedIds) { const t = this.transactions.get(id); if (t && t.itemId === item.itemId) t.removed = true; }
-    const x = this.items.get(item.itemId); if (x) x.transactions_cursor = cursor || null;
+    row.transactions_cursor = cursor || null;
+    return true;
   }
   async storedTransactions(userId, limit = 250) {
     const safeLimit = Math.max(1, Math.min(Number(limit) || 250, 500));

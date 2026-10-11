@@ -94,3 +94,33 @@ test('PgStore.deleteUserData and legacy cleanup', { skip: !url && 'TEST_DATABASE
   assert.equal(await store.getExchanged('hL1'), null);
   await store.close(); await raw.end();
 });
+
+test('PgStore.revokeItem purges only that item and blocks late syncs', { skip: !url && 'TEST_DATABASE_URL not set' }, async () => {
+  const key = crypto.randomBytes(32);
+  const raw = new pg.Pool({ connectionString: url });
+  await raw.query('DROP TABLE IF EXISTS plaid_items, plaid_transactions, plaid_pending_links, plaid_exchanged_public_tokens');
+  const store = new PgStore({ url, ssl: false }, key);
+  await store.init();
+  await store.putItem({ userId: 'u1', itemId: 'r', accessToken: 'access-sandbox-r' });
+  await store.putItem({ userId: 'u1', itemId: 'k', accessToken: 'access-sandbox-k' });
+  assert.equal(await store.applySync('u1', { itemId: 'r' }, { upserts: [{ transaction_id: 'tr', date: '2026-01-02' }], removedIds: [], cursor: 'cr' }), true);
+  await store.applySync('u1', { itemId: 'k' }, { upserts: [{ transaction_id: 'tk', date: '2026-01-01' }], removedIds: [], cursor: 'ck' });
+  await store.setNewAccountsAvailable('r', true);
+  await store.markExchanged('hr', 'u1', 'r'); await store.markExchanged('hk', 'u1', 'k');
+  await store.putPending('u1', 'link-u', { mode: 'update', itemId: 'r' });
+
+  await store.setItemStatus('r', 'revoked', 'USER_PERMISSION_REVOKED'); // routes to revokeItem
+  const r = await store.getItemById('r');
+  assert.equal(r.status, 'revoked'); assert.equal(r.errorCode, 'USER_PERMISSION_REVOKED');
+  assert.equal(r.transactionsCursor, null); assert.equal(r.newAccountsAvailable, false);
+  assert.equal(r.accessToken, 'access-sandbox-r', 'encrypted token kept for update mode');
+  assert.deepEqual((await store.storedTransactions('u1')).map(t => t.transaction_id), ['tk']);
+  assert.equal(await store.getExchanged('hr'), null); assert.ok(await store.getExchanged('hk'));
+  assert.equal(await store.getPending('u1'), null);
+  assert.equal((await store.getItemById('k')).transactionsCursor, 'ck');
+
+  assert.equal(await store.applySync('u1', { itemId: 'r' }, { upserts: [{ transaction_id: 'late' }], removedIds: [], cursor: 'late' }), false);
+  assert.equal((await raw.query(`SELECT count(*)::int n FROM plaid_transactions WHERE item_id='r'`)).rows[0].n, 0);
+  assert.equal((await store.getItemById('r')).transactionsCursor, null);
+  await store.close(); await raw.end();
+});

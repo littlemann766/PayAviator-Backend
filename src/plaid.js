@@ -77,7 +77,12 @@ export const LOGIN_REQUIRED_CODES = new Set([
   'PASSWORD_RESET_REQUIRED', 'ACCESS_NOT_GRANTED', 'NO_ACCOUNTS',
 ]);
 
-export function statusForItemError(errorCode) {
+/** Item error codes / reasons that mean the user withdrew consent: stored data for the Item is purged. */
+export const REVOKED_CODES = new Set(['USER_PERMISSION_REVOKED', 'USER_ACCOUNT_REVOKED']);
+export const REVOKED_REASONS = new Set(['OAUTH_USER_REVOKED']);
+
+export function statusForItemError(errorCode, errorCodeReason = null) {
+  if (REVOKED_CODES.has(errorCode) || REVOKED_REASONS.has(errorCodeReason)) return ITEM_STATUS.REVOKED;
   return LOGIN_REQUIRED_CODES.has(errorCode) ? ITEM_STATUS.LOGIN_REQUIRED : ITEM_STATUS.ERROR;
 }
 

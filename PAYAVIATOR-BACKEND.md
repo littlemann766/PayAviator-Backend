@@ -70,6 +70,19 @@ Authenticated (`Authorization: Bearer ...`). Legacy `/:userId` variants still wo
 4. Show `error` from error responses to users (it is Plaid's `display_message` or a generic message); log `request_id` for support.
 5. Call `DELETE /api/plaid/user` when a user deletes their PayAviator account.
 
+## Revoked consent (USER_PERMISSION_REVOKED / USER_ACCOUNT_REVOKED)
+When Plaid reports that the user revoked access (the `ITEM` webhooks `USER_PERMISSION_REVOKED` or `USER_ACCOUNT_REVOKED`, an `ITEM`
+`ERROR` / API error with one of those codes, or any Item error with reason `OAUTH_USER_REVOKED`), the backend, in one DB transaction:
+- deletes all of that Item's stored transactions and its exchanged-public-token hash rows,
+- deletes a pending update-mode link for that Item and resets its `/transactions/sync` cursor,
+- keeps only the minimal Item row (item/institution ids and name, `status: "revoked"`, error code, encrypted access token) so
+  `GET /api/plaid/accounts` still lists it with `needs_update: true` and the app can offer "Reconnect" or "Remove".
+
+Syncs that were already running when the revocation arrived are discarded instead of written back. `/item/remove` is not called
+automatically: Plaid ends subscription billing when the user revokes, and keeping the Item lets update mode restore it. If the user
+reconnects, the Item returns to `good` and re-syncs from scratch. If they choose "Remove", `DELETE /api/plaid/items/:itemId`
+deletes the row. If update mode can't start for a revoked Item, Plaid's guidance is to create a fresh link token (new connection).
+
 ## Post-3.9.7 step: remove legacy (pre-Firebase) bank links
 App versions before 3.9.7 stored banks under self-generated IDs (`pp-…`, `ppd_…`). After the Firebase sign-in build is live and
 users have relinked, remove those orphaned Plaid Items. Otherwise they stay billed and their data stays stored.

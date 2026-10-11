@@ -21,7 +21,8 @@ export async function handleWebhook(payload, { store, syncItem, log }) {
     switch (code) {
       case 'ERROR': {
         const errCode = payload?.error?.error_code || 'ITEM_ERROR';
-        await store.setItemStatus(itemId, statusForItemError(errCode), errCode);
+        // A revoked status purges the Item's stored transactions (see store.revokeItem).
+        await store.setItemStatus(itemId, statusForItemError(errCode, payload?.error?.error_code_reason), errCode);
         break;
       }
       case 'LOGIN_REPAIRED':
@@ -35,7 +36,11 @@ export async function handleWebhook(payload, { store, syncItem, log }) {
         break;
       case 'USER_PERMISSION_REVOKED':
       case 'USER_ACCOUNT_REVOKED':
-        await store.setItemStatus(itemId, ITEM_STATUS.REVOKED, payload?.error?.error_code || code);
+        // Consent withdrawn: delete the Item's transactions, sync cursor, pending link and exchanged-token
+        // rows; keep only the minimal Item row so the app can show "Reconnect". /item/remove is NOT called:
+        // Plaid stops subscription billing on user revocation, and keeping the Item lets update mode restore it.
+        await store.revokeItem(itemId, payload?.error?.error_code || code);
+        log.info('item revoked, stored data purged', ctx);
         break;
       case 'NEW_ACCOUNTS_AVAILABLE':
         await store.setNewAccountsAvailable(itemId, true);

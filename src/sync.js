@@ -55,10 +55,14 @@ export function createSyncer({ store, plaid, log, maxPages = 100, maxRestarts = 
           continue;
         }
         const itemCode = itemErrorCode(e);
-        if (itemCode) await store.setItemStatus(item.itemId, statusForItemError(itemCode), itemCode);
+        if (itemCode) await store.setItemStatus(item.itemId, statusForItemError(itemCode, e?.response?.data?.error_code_reason), itemCode);
         throw e;
       }
-      await store.applySync(item.userId, item, { upserts: [...upserts.values()], removedIds: [...removed], cursor });
+      const applied = await store.applySync(item.userId, item, { upserts: [...upserts.values()], removedIds: [...removed], cursor });
+      if (applied === false) {
+        log.warn('transactions sync discarded (item revoked or removed meanwhile)', { item_id: item.itemId });
+        return { item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', added: 0, modified: 0, removed: 0, pages, discarded: true };
+      }
       item.transactionsCursor = cursor;
       return { item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', added, modified, removed: removedCount, pages };
     }
