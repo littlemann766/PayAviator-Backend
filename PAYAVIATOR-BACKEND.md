@@ -3,7 +3,11 @@
 This is the single deployment authority for the PayAviator banking backend.
 
 ## Runtime
-- Node >= 20 / Express 5 backend for Plaid read-only connected accounts (Transactions + balances).
+- Node 24 LTS / Express 5 backend for Plaid read-only connected accounts (Transactions + balances).
+- Node version: Railway builds this service with Railpack, which takes the version from `RAILPACK_NODE_VERSION` (if set), else
+  `package.json` `engines.node` (`24.x`), else `.nvmrc` / `.node-version` (both `24`). Leave `RAILPACK_NODE_VERSION` unset so the repo
+  stays the single source of truth. Node 20 reached end of life on 2026-04-30; do not pin below 24. After a deploy, the build log
+  shows the resolved Node version.
 - Railway service + Railway PostgreSQL.
 - Entry point `server.js`; modules in `src/` (`config`, `auth`, `crypto`, `store`, `plaid`, `sync`, `webhooks`, `webhookVerify`, `app`).
 - `npm test` runs the unit tests. Set `TEST_DATABASE_URL` to a disposable Postgres DB to also run the storage integration test.
@@ -36,7 +40,7 @@ Transactions returned to the app are history/information. The app uses live incl
    | `CORS_ORIGINS` | `https://appassets.androidplatform.net` plus any PWA origin |
 
    Do not put `sslmode=` in `DATABASE_URL`; TLS is controlled by the variables above.
-3. Deploy (`npm ci && npm start`). Check the logs for `database ready` and any `!!!` warnings, then `GET /api/health`.
+3. Deploy (`npm ci && npm start`; Railpack installs Node 24 from `engines.node`). Check the logs for `database ready` and any `!!!` warnings, then `GET /api/health`.
 4. In Sandbox first: link a Sandbox institution, then fire test webhooks with `/sandbox/item/fire_webhook` and test update mode with `/sandbox/item/reset_login`.
 5. Switch to Production only by changing `PLAID_ENV` + `PLAID_SECRET`. Sandbox Items do not work in Production; users relink.
 
