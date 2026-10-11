@@ -300,9 +300,15 @@ app.post('/api/plaid/create-link-token', async (req, res) => {
   }
 });
 
-app.get('/api/plaid/hosted-status/:userId', async (req, res) => {
+app.get('/api/plaid/hosted-status', async (req, res) => {
+  // Compatibility: old app called this without a userId
+  req.params = req.params || {};
+  req.params.userId = 'payaviator-local-user';
+  return hostedStatusHandler(req, res);
+});
+async function hostedStatusHandler(req, res) {
   if (!requirePlaid(res)) return;
-  const userId = String(req.params.userId || '');
+  const userId = String(req.params.userId || 'payaviator-local-user');
   try {
     const linkToken = await getPending(userId);
     if (!linkToken) {
@@ -382,7 +388,7 @@ app.get('/api/plaid/hosted-status/:userId', async (req, res) => {
       request_id: d?.request_id || null,
     });
   }
-});
+}
 
 app.post('/api/plaid/exchange-public-token', async (req, res) => {
   if (!requirePlaid(res)) return;
@@ -413,7 +419,12 @@ function physicalAccountKey(a, institutionName = '') {
     : String(a?.account_id || a?.id || [institution,type,subtype,name].join('|'));
 }
 
-app.get('/api/plaid/accounts/:userId', async (req, res) => {
+app.get('/api/plaid/accounts', async (req, res) => {
+  req.params = { userId: 'payaviator-local-user' };
+  return accountsHandler(req, res);
+});
+app.get('/api/plaid/accounts/:userId', accountsHandler);
+async function accountsHandler(req, res) {
   if (!requirePlaid(res)) return;
   try {
     const items = await getItems(req.params.userId);
@@ -470,7 +481,7 @@ app.get('/api/plaid/accounts/:userId', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'accounts_failed' });
   }
-});
+}
 
 app.delete('/api/plaid/items/:userId/:itemId', async (req, res) => {
   if (!requirePlaid(res)) return;
@@ -529,7 +540,12 @@ async function storedTransactions(userId, limit=250){
     .slice(0,safeLimit);
 }
 
-app.get('/api/plaid/transactions/:userId', async (req,res)=>{
+app.get('/api/plaid/transactions', async (req, res) => {
+  req.params = { userId: 'payaviator-local-user' };
+  return transactionsHandler(req, res);
+});
+app.get('/api/plaid/transactions/:userId', transactionsHandler);
+async function transactionsHandler(req,res){
   if(!requirePlaid(res))return;
   try{
     const userId=req.params.userId,items=await getItems(userId),errors=[],sync=[];
@@ -550,7 +566,7 @@ app.get('/api/plaid/transactions/:userId', async (req,res)=>{
     }
     res.json({transactions:await storedTransactions(userId,req.query.limit||250),fetched_at:new Date().toISOString(),sync,errors});
   }catch(e){console.error('transactions sync failed',e?.response?.data||e);res.status(500).json({error:'transactions_sync_failed',message:e?.response?.data?.error_message||e?.message||String(e)})}
-});
+}
 
 
 app.get('/api/plaid/transactions-status/:userId', async (req,res)=>{
