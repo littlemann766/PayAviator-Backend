@@ -49,6 +49,8 @@ test('PgStore: legacy plaintext migration is idempotent; CRUD works', { skip: !u
   await store.deleteItem('u1', 'i2');
   assert.equal(await store.getItemById('i2'), null);
   assert.equal((await raw.query(`SELECT count(*)::int n FROM plaid_transactions WHERE item_id='i2'`)).rows[0].n, 0);
+  assert.equal(await store.getExchanged('h1'), null, 'single-bank delete removes its public-token hash rows');
+  assert.equal(await store.getPending('u1'), null, 'and its pending update link');
   await store.close(); await raw.end();
 });
 

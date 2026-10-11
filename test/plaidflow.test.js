@@ -72,6 +72,33 @@ test('DELETE keeps the item if /item/remove fails, deletes it and its transactio
   assert.equal((await store.storedTransactions('user-1')).length, 0);
 });
 
+test('DELETE one item also deletes its public-token hash rows and pending update link, leaving other banks intact', async () => {
+  const plaid = fakePlaid({ itemRemove: async () => ({}) });
+  const { app, store } = buildApp({ plaid });
+  await store.putItem({ userId: 'user-1', itemId: 'item-1', accessToken: 'access-sandbox-1' });
+  await store.putItem({ userId: 'user-1', itemId: 'item-2', accessToken: 'access-sandbox-2' });
+  await store.applySync('user-1', { itemId: 'item-2' }, { upserts: [{ transaction_id: 't2', date: '2026-01-01' }], removedIds: [], cursor: 'c2' });
+  await store.markExchanged('h-1a', 'user-1', 'item-1');
+  await store.markExchanged('h-1b', 'user-1', 'item-1');
+  await store.markExchanged('h-2', 'user-1', 'item-2');
+  await store.putPending('user-1', 'link-upd', { mode: 'update', itemId: 'item-1' });
+
+  const r = await request(app).delete('/api/plaid/items/item-1').set('Authorization', await bearer());
+  assert.equal(r.status, 200);
+  assert.equal(await store.getExchanged('h-1a'), null);
+  assert.equal(await store.getExchanged('h-1b'), null);
+  assert.ok(await store.getExchanged('h-2'), 'other bank keeps its hash row');
+  assert.equal(await store.getPending('user-1'), null);
+  assert.deepEqual((await store.getItems('user-1')).map(i => i.itemId), ['item-2']);
+  assert.deepEqual((await store.storedTransactions('user-1')).map(t => t.transaction_id), ['t2']);
+
+  // A pending link for a different item (or a new connection) is not touched.
+  await store.putItem({ userId: 'user-1', itemId: 'item-3', accessToken: 'access-sandbox-3' });
+  await store.putPending('user-1', 'link-add', { mode: 'add' });
+  await request(app).delete('/api/plaid/items/item-3').set('Authorization', await bearer());
+  assert.deepEqual(await store.getPending('user-1'), { linkToken: 'link-add', mode: 'add', itemId: null });
+});
+
 test('sync restarts from saved cursor on TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION', async () => {
   const store = new MemoryStore();
   await store.putItem({ userId: 'u', itemId: 'i', accessToken: 'access-x' });

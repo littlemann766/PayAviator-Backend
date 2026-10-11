@@ -59,7 +59,7 @@ Authenticated (`Authorization: Bearer ...`). Legacy `/:userId` variants still wo
 | `GET /api/plaid/accounts` | Balances plus `items[]` with `status`, `error_code`, `needs_update`, `new_accounts_available`. |
 | `GET /api/plaid/transactions?limit=250&refresh=1` | Syncs (unless `refresh=0`) and returns stored transactions + per-item `errors`. |
 | `GET /api/plaid/transactions-status` | Per-item Plaid product status. |
-| `DELETE /api/plaid/items/:itemId` | Disconnects (calls `/item/remove`, deletes the item's transactions). |
+| `DELETE /api/plaid/items/:itemId` | Disconnects one bank: calls `/item/remove`, then deletes the item, its transactions, its exchanged-public-token hash rows and any pending update-mode link for it, in one DB transaction. If `/item/remove` fails the row is kept so the call can be retried. |
 | `DELETE /api/plaid/user` | Account deletion: removes every Item at Plaid, then deletes the user's items, transactions, pending links and exchanged-token rows in one DB transaction. Items whose removal failed are kept (502 + `failed_item_ids`) so the call can be retried. |
 
 ## Android app changes required (breaking)

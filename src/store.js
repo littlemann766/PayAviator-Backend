@@ -116,11 +116,14 @@ export class PgStore {
     return r.rows[0] ? rowToItem(r.rows[0], this.key) : null;
   }
 
+  /** Single-bank disconnect: deletes the Item, its transactions, exchanged-token hashes and a pending update link for it. */
   async deleteItem(userId, itemId) {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       await client.query('DELETE FROM plaid_transactions WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
+      await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
+      await client.query('DELETE FROM plaid_pending_links WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('DELETE FROM plaid_items WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('COMMIT');
     } catch (e) {
@@ -277,6 +280,8 @@ export class MemoryStore {
     if (!x || x.user_id !== userId) return;
     this.items.delete(itemId);
     for (const [id, t] of this.transactions) if (t.itemId === itemId) this.transactions.delete(id);
+    for (const [h, e] of this.exchanged) if (e.itemId === itemId && e.userId === userId) this.exchanged.delete(h);
+    const p = this.pending.get(userId); if (p && p.itemId === itemId) this.pending.delete(userId);
   }
   async deleteUserData(userId, { keepItemIds = [] } = {}) {
     const keep = new Set(keepItemIds);
