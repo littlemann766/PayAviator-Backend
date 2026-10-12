@@ -6,9 +6,11 @@ export const TOKEN_PREFIX = 'enc:v1:';
 
 export function parseEncryptionKey(value) {
   if (!value) throw new Error('TOKEN_ENCRYPTION_KEY is empty');
-  const key = Buffer.from(String(value).trim(), 'base64');
+  const v = String(value).trim();
+  // Accept 32 bytes as 64 hex chars (e.g. `openssl rand -hex 32`) or as base64.
+  const key = /^[0-9a-fA-F]{64}$/.test(v) ? Buffer.from(v, 'hex') : Buffer.from(v, 'base64');
   if (key.length !== 32) {
-    throw new Error(`TOKEN_ENCRYPTION_KEY must be 32 bytes encoded as base64 (got ${key.length} bytes). Generate one with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`);
+    throw new Error(`TOKEN_ENCRYPTION_KEY must be 32 bytes encoded as 64 hex chars or base64 (got ${key.length} bytes). Generate one with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`);
   }
   return key;
 }
