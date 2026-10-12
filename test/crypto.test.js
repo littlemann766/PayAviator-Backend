@@ -31,6 +31,7 @@ test('legacy plaintext is passed through (migrated on boot)', () => {
 
 test('parseEncryptionKey requires exactly 32 bytes', () => {
   assert.equal(parseEncryptionKey(key.toString('base64')).length, 32);
+  assert.deepEqual(parseEncryptionKey(key.toString('hex')), key);
   assert.throws(() => parseEncryptionKey(crypto.randomBytes(31).toString('base64')));
 });
 
