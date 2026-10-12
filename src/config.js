@@ -167,6 +167,13 @@ export function loadConfig(env = process.env) {
     rtdnAudience: env.GOOGLE_PLAY_RTDN_AUDIENCE || null,
     rtdnServiceAccountEmail: env.GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT || null,
   };
+  const integrity = {
+    enforce: String(env.PLAY_INTEGRITY_ENFORCE || '').trim().toLowerCase() === 'true',
+    configured: Boolean(playServiceAccount && androidPackageName),
+    serviceAccount: playServiceAccount,
+    packageName: androidPackageName || null,
+  };
+  if (integrity.enforce && !integrity.configured) warnings.push('PLAY_INTEGRITY_ENFORCE=true but GOOGLE_PLAY_SERVICE_ACCOUNT_JSON/ANDROID_PACKAGE_NAME missing: free-tier links return 503 integrity_not_configured');
   if (isProduction && !billing.configured) warnings.push('Google Play billing not configured (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON + ANDROID_PACKAGE_NAME); second bank links will be refused');
 
   if (errors.length) throw new ConfigError(errors);
@@ -198,6 +205,7 @@ export function loadConfig(env = process.env) {
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
       billing,
       freeTier,
+      integrity,
       rateLimit: {
         windowMs: 15 * 60 * 1000,
         max: Number(env.RATE_LIMIT_MAX || 300),

@@ -27,9 +27,9 @@ export function fakePlaid(handlers = {}) {
   };
 }
 
-export function buildApp({ config = testConfig(), store = new MemoryStore(), plaid = fakePlaid(), webhookVerifier, syncItem, googlePlay = null, pubsubVerifier = null } = {}) {
+export function buildApp({ config = testConfig(), store = new MemoryStore(), plaid = fakePlaid(), webhookVerifier, syncItem, googlePlay = null, pubsubVerifier = null, integrity = null } = {}) {
   const app = createApp({
-    config, store, plaid, log: silentLog, googlePlay, pubsubVerifier,
+    config, store, plaid, log: silentLog, googlePlay, pubsubVerifier, integrity,
     tokenVerifier: createTokenVerifier(config.auth),
     webhookVerifier: webhookVerifier || (async () => { throw new Error('no verifier'); }),
     syncItem: syncItem || (async item => ({ item_id: item.itemId })),

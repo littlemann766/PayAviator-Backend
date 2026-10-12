@@ -9,7 +9,8 @@ which phones have already used a free slot.
 For a **free** bank link only, the server keeps:
 1. A fingerprint of each linked account made from the bank's ID plus the account's last 4 digits.
 2. A fingerprint of Plaid's long-lived account ID (`persistent_account_id`), when Plaid gives one.
-3. A fingerprint of the phone's app-generated device ID (sent by the app as `X-Device-Id`).
+3. A fingerprint of the phone's Android ID (`Settings.Secure.ANDROID_ID`, sent by the app as
+   `X-Device-Id`). Only the HMAC is stored; the raw Android ID is never written to the database or logs.
 
 Each fingerprint is a keyed hash (HMAC-SHA256) using a secret that only the server holds.
 We never store the last 4 digits, the Plaid account ID, or the device ID themselves. The
@@ -34,12 +35,15 @@ used a free slot on a **different** account. If so, we cancel the new connection
 - Bank data itself (access tokens, transactions) is still deleted right away as before; only
   these fingerprints wait out the 30 days.
 
-## Not yet in use
-The app may send a Google Play Integrity token (`X-Play-Integrity-Token`). The server accepts
-it but does not read or store it yet; that's a planned follow-up.
+## Google Play Integrity
+When `PLAY_INTEGRITY_ENFORCE=true`, a free bank link also needs a Play Integrity token
+(`X-Play-Integrity-Token`). The server sends it to Google's `decodeIntegrityToken` API and checks
+the verdict (genuine app from Play, genuine device, our package, fresh, bound to this device and
+account). The token and verdict are **not stored**; only a pass/fail reason may appear in logs.
+When the flag is off the header is ignored.
 
 ## Suggested policy wording
 "To prevent misuse of our free plan, when you link a bank on the free plan we keep a
 one-way, encrypted fingerprint of the bank account (based on the bank and the account's last
-four digits) and of your device's app ID. We cannot read the original details from these
+four digits) and of your device's Android ID. We cannot read the original details from these
 fingerprints. They're deleted 30 days after you remove the bank or delete your account."

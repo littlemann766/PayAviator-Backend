@@ -48,9 +48,9 @@ under the former generic identity or transient memory may require one reconnect.
 
 ### Free-tier anti-abuse (added to PR #8)
 - **New bank links** (`create-link-token`, `exchange-public-token`, hosted-status add mode) require Firebase claim `email_verified === true` → else `403 {"error":"email_not_verified","code":"EMAIL_NOT_VERIFIED"}`. Update mode is not affected.
-- Free users must send header **`X-Device-Id`** (app-generated, 8–256 printable chars, stable per install) on those calls, including hosted-status polling → else `400 device_id_required`. Subscribers don't need it.
+- Free users must send header **`X-Device-Id`** = `Settings.Secure.ANDROID_ID` (exactly 16 hex chars; survives reinstall/clear-data) → malformed = `400 device_id_invalid`; on those calls, including hosted-status polling → else `400 device_id_required`. Subscribers don't need it.
 - `402 subscription_required` now may carry `reason`: `device_already_used_free` (this phone already gave another account its free bank) or `account_already_used_free` (this bank account is another account's free bank; the new Item is removed at Plaid and not stored). No `reason` = plain 1-bank limit.
 - `503 free_tier_not_configured` when `FREE_TIER_FINGERPRINT_SECRET` is missing (fail closed; subscribers unaffected; server still starts and logs an error).
-- `X-Play-Integrity-Token` accepted and ignored (follow-up).
+- `PLAY_INTEGRITY_ENFORCE=true`: free links also need `X-Play-Integrity-Token` (standard request, `requestHash = sha256hex(lower(ANDROID_ID) + "|" + firebaseUid)`). Server decodes via playintegrity v1 and requires PLAY_RECOGNIZED, MEETS_DEVICE_INTEGRITY, our package, ≤5 min old, matching hash → else `403 integrity_failed` + `reason`; Play not configured → `503 integrity_not_configured`. Flag off → header ignored.
 - Only HMAC-SHA256 hashes stored (`free_tier_claims`); 30-day cooldown after bank/account deletion (`FREE_TIER_COOLDOWN_DAYS`), purged on startup + daily. See `docs/PRIVACY-DATA-NOTES.md`.
 - Subscribers skip fingerprint/device checks; grandfathered users' existing banks are untouched.

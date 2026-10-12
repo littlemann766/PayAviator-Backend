@@ -25,10 +25,14 @@ export function deviceFingerprint(secret, deviceId) {
   return { kind: KIND.DEVICE, hash: hmac(secret, `device|${String(deviceId).trim()}`) };
 }
 
-/** Raw X-Device-Id: app-generated, 8..256 printable chars. */
+/**
+ * X-Device-Id is Android's Settings.Secure.ANDROID_ID: exactly 16 hex chars (survives reinstall
+ * and clear-data for the same signing key + user). Returns { id } (lowercased), { missing } or { invalid }.
+ */
 export function readDeviceId(req) {
   const v = String(req.get('x-device-id') || '').trim();
-  return /^[\x21-\x7e]{8,256}$/.test(v) ? v : null;
+  if (!v) return { missing: true };
+  return /^[0-9a-fA-F]{16}$/.test(v) ? { id: v.toLowerCase() } : { invalid: true };
 }
 
 export const gateError = (status, body) => Object.assign(new Error(body.error), { status, body });

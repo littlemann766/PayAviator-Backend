@@ -14,7 +14,7 @@ const plaidErr = (status, error_code, error_type = 'API_ERROR') => Object.assign
 test('link token uses webhook, redirect_uri, days_requested and user from token', async () => {
   const plaid = fakePlaid({ linkTokenCreate: async () => ({ link_token: 'link-1', hosted_link_url: 'https://hosted' }) });
   const { app } = buildApp({ plaid });
-  const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).set('X-Device-Id', 'device-test-1').send({});
+  const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).set('X-Device-Id', '0123456789abcdef').send({});
   assert.equal(r.status, 200);
   const req = plaid.calls[0].req;
   assert.equal(req.user.client_user_id, 'user-1');

@@ -29,7 +29,7 @@ test('free user: first bank allowed, second gets 402 on create-link-token and ex
   const plaid = linkPlaid();
   const { app, store } = buildApp({ plaid });
   const auth = await bearer();
-  const post = path => request(app).post(path).set('Authorization', auth).set('X-Device-Id', 'device-test-1');
+  const post = path => request(app).post(path).set('Authorization', auth).set('X-Device-Id', '0123456789abcdef');
   assert.equal((await post('/api/plaid/create-link-token').send({})).status, 200);
   assert.equal((await post('/api/plaid/exchange-public-token').send({ public_token: 'p1' })).status, 200);
   const r = await post('/api/plaid/create-link-token').send({});
@@ -57,7 +57,7 @@ test('revoked items do not count toward the limit', async () => {
   const { app, store } = buildApp({ plaid: linkPlaid() });
   await store.putItem({ userId: 'user-1', itemId: 'item-1', accessToken: 'a1' });
   await store.revokeItem('item-1');
-  assert.equal((await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).set('X-Device-Id', 'device-test-1').send({})).status, 200);
+  assert.equal((await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).set('X-Device-Id', '0123456789abcdef').send({})).status, 200);
 });
 
 test('grandfathered user with 2 banks keeps them, can relink, cannot add a third', async () => {

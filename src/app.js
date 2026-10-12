@@ -8,6 +8,7 @@ import { clientError, plaidErrorInfo, itemErrorCode, statusForItemError, ITEM_ST
 import { sha256Hex } from './crypto.js';
 import { handleWebhook } from './webhooks.js';
 import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from './freeTier.js';
+import { checkVerdict } from './integrity.js';
 import { FREE_BANK_LIMIT, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
 
 /** Items in these states cannot be used until the user completes update mode. */
@@ -62,7 +63,7 @@ function decorateAccount(a, item) {
   };
 }
 
-export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null }) {
+export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -238,8 +239,24 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   /**
    * Checks before a NEW bank link (never update mode): verified email, plan limit, and for the free
-   * tier a per-device slot. X-Play-Integrity-Token is accepted but not yet verified (follow-up).
+   * tier a per-device slot (ANDROID_ID, HMAC'd) and, when PLAY_INTEGRITY_ENFORCE=true, a valid
+   * Play Integrity verdict bound to sha256(androidId|uid). Subscribers skip all of it.
    */
+  async function checkIntegrity(req, deviceId, userId) {
+    if (!config.integrity.configured || !integrity) throw gateError(503, { error: 'integrity_not_configured', code: 'INTEGRITY_NOT_CONFIGURED' });
+    const deny = reason => gateError(403, { error: 'integrity_failed', code: 'INTEGRITY_FAILED', reason });
+    const token = String(req.get('x-play-integrity-token') || '').trim();
+    if (!token) throw deny('token_missing');
+    if (token.length > 8192) throw deny('token_invalid');
+    let payload;
+    try { payload = await integrity.decode(token); } catch (e) {
+      log.warn('integrity decode failed', { user_id: userId, error_message: e.message });
+      throw deny('token_invalid');
+    }
+    const reason = checkVerdict(payload, { packageName: config.integrity.packageName, deviceId, uid: userId });
+    if (reason) { log.warn('integrity check failed', { user_id: userId, reason }); throw deny(reason); }
+  }
+
   async function linkGate(req, userId) {
     if (config.auth?.mode !== 'disabled' && req.authClaims?.email_verified !== true) {
       throw gateError(403, { error: 'email_not_verified', code: 'EMAIL_NOT_VERIFIED' });
@@ -249,8 +266,11 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     const limitBody = reason => ({ error: 'subscription_required', code: 'SUBSCRIPTION_REQUIRED', limit: FREE_BANK_LIMIT, linked: s.linkedBanks, ...(reason ? { reason } : {}) });
     if (s.linkedBanks >= FREE_BANK_LIMIT) throw gateError(402, limitBody());
     if (!config.freeTier?.configured) throw gateError(503, { error: 'free_tier_not_configured', code: 'FREE_TIER_NOT_CONFIGURED' });
-    const deviceId = readDeviceId(req);
-    if (!deviceId) throw gateError(400, { error: 'device_id_required', code: 'DEVICE_ID_REQUIRED' });
+    const dev = readDeviceId(req);
+    if (dev.missing) throw gateError(400, { error: 'device_id_required', code: 'DEVICE_ID_REQUIRED' });
+    if (dev.invalid) throw gateError(400, { error: 'device_id_invalid', code: 'DEVICE_ID_INVALID' });
+    const deviceId = dev.id;
+    if (config.integrity?.enforce) await checkIntegrity(req, deviceId, userId);
     const device = deviceFingerprint(config.freeTier.secret, deviceId);
     if (await store.findFreeTierConflict(userId, [device])) throw gateError(402, limitBody('device_already_used_free'));
     return { free: true, device, limitBody };
@@ -422,8 +442,8 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       await store.clearPending(req.userId);
       res.json(out);
     } catch (e) {
-      if (e.status === 403) return res.status(403).json({ error: 'Forbidden.', code: 'USER_MISMATCH' });
       if (isGateError(e)) return res.status(e.status).json(e.body);
+      if (e.status === 403) return res.status(403).json({ error: 'Forbidden.', code: 'USER_MISMATCH' });
       fail(res, e, 'public token exchange failed', 'Could not finish connecting this bank.', 'TOKEN_EXCHANGE_FAILED');
     }
   });
