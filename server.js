@@ -2,9 +2,10 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
+import { verify as verifySignature } from 'node:crypto';
 import { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } from 'plaid';
 
-const APP_VERSION = '3.1.7';
+const APP_VERSION = '3.1.8';
 const app = express();
 
 // The Android app is served from appassets.androidplatform.net and the browser/PWA
@@ -12,6 +13,67 @@ const app = express();
 // requesting origin is appropriate here and keeps Android WebView preflights simple.
 app.use(cors({ origin: true, methods: ['GET', 'POST', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Accept', 'Authorization'] }));
 app.use(express.json({ limit: '1mb' }));
+// Verify Firebase ID tokens with Google's rotating signing certificates.
+// This uses Node's built-in crypto so the existing npm lockfile stays deployable.
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'payaviator-app';
+const FIREBASE_CERT_URL = 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+let firebaseCertificates = null;
+let firebaseCertificatesUntil = 0;
+async function getFirebaseSigningCerts() {
+  if (firebaseCertificates && Date.now() < firebaseCertificatesUntil) return firebaseCertificates;
+  const response = await fetch(FIREBASE_CERT_URL, { signal: AbortSignal.timeout(8000) });
+  if (!response.ok) throw new Error('Could not load Firebase verification certificates');
+  const certificates = await response.json();
+  if (!certificates || typeof certificates !== 'object' || !Object.keys(certificates).length)
+    throw new Error('Firebase verification certificates are empty');
+  const cacheControl = String(response.headers.get('cache-control') || '');
+  const ttl = Number(/(?:^|,)\s*max-age=(\d+)/i.exec(cacheControl)?.[1] || 300);
+  firebaseCertificates = certificates;
+  firebaseCertificatesUntil = Date.now() + Math.max(60, Math.min(ttl, 3600)) * 1000;
+  return certificates;
+}
+async function verifyFirebaseIdToken(token) {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 16000)
+    throw new Error('Invalid Firebase identity token');
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts.some(p => !/^[A-Za-z0-9_-]+$/.test(p)))
+    throw new Error('Malformed Firebase identity token');
+  let header, claims;
+  try {
+    header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  } catch (_) { throw new Error('Invalid Firebase identity claims'); }
+  if (header?.alg !== 'RS256' || typeof header?.kid !== 'string' || !header.kid)
+    throw new Error('Untrusted Firebase signing algorithm');
+  const now = Math.floor(Date.now()/1000);
+  if (claims?.aud !== FIREBASE_PROJECT_ID || claims?.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}` ||
+      typeof claims?.sub !== 'string' || !claims.sub || claims.sub.length > 128 ||
+      typeof claims?.exp !== 'number' || claims.exp <= now ||
+      typeof claims?.iat !== 'number' || claims.iat > now + 60 ||
+      typeof claims?.auth_time !== 'number' || claims.auth_time > now + 60)
+    throw new Error('Firebase identity has expired or belongs to another project');
+  const certificates = await getFirebaseSigningCerts();
+  if (!Object.prototype.hasOwnProperty.call(certificates,header.kid))
+    throw new Error('Unknown Firebase certificate');
+  const valid = verifySignature('RSA-SHA256', Buffer.from(parts[0]+'.'+parts[1]),
+    certificates[header.kid], Buffer.from(parts[2],'base64url'));
+  if (!valid) throw new Error('Firebase signature could not be verified');
+  return claims.sub;
+}
+// No banking route accepts caller-chosen user IDs. Scope every Plaid item to the
+// verified Firebase UID, including the old compatibility URLs.
+app.use('/api/plaid', async (req, res, next) => {
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+  if (!match) return res.status(401).json({ code: 'UNAUTHENTICATED', error: 'Sign in to PayAviator to use connected banking.' });
+  try {
+    req.bankUserId = await verifyFirebaseIdToken(match[1]);
+    next();
+  } catch (e) {
+    console.warn('PayAviator bank authentication rejected:',e?.message);
+    return res.status(401).json({ code: 'INVALID_TOKEN', error: 'Bank account verification failed. Sign in again and check your connection.' });
+  }
+});
+
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
@@ -97,11 +159,11 @@ async function initStorage() {
     dbError = null;
     console.log('PayAviator database connected.');
   } catch (err) {
-    // Do not take the whole Plaid API offline just because Postgres is unavailable.
-    // Sandbox/testing can continue with in-memory storage while Railway/DB is fixed.
+    // Do not silently switch real bank connections to temporary storage.
+    // Banking routes return a descriptive 503 until persistent storage is available.
     dbReady = false;
     dbError = err?.message || String(err);
-    console.error('Database unavailable; using memory fallback:', dbError);
+    console.error('Database unavailable; connected banking disabled:', dbError);
   }
 }
 
@@ -113,6 +175,7 @@ async function putItem(x) {
       `INSERT INTO plaid_items(user_id,item_id,access_token,institution_id,institution_name)
        VALUES($1,$2,$3,$4,$5)
        ON CONFLICT(item_id) DO UPDATE SET
+         user_id=EXCLUDED.user_id,
          access_token=EXCLUDED.access_token,
          institution_id=EXCLUDED.institution_id,
          institution_name=EXCLUDED.institution_name,
@@ -175,6 +238,11 @@ function plaidError(e, fallback) {
 }
 
 function requirePlaid(res) {
+  if (!useDb()) {
+    res.status(503).json({ code: 'PERSISTENT_STORAGE_REQUIRED',
+      error: 'Permanent bank storage is unavailable. Configure Railway Postgres and DATABASE_URL before linking banks.' });
+    return false;
+  }
   if (plaidConfigured) return true;
   res.status(503).json({
     error: 'Plaid credentials are not configured on the PayAviator backend.',
@@ -227,7 +295,7 @@ function healthPayload() {
     plaidEnvironment: env,
     plaidConfigured,
     hostedLink: true,
-    storage: useDb() ? 'postgres' : (pool ? 'memory-fallback' : 'memory'),
+    storage: useDb() ? 'postgres' : 'unavailable',
     databaseConfigured: Boolean(pool),
     databaseReady: dbReady,
   };
@@ -246,7 +314,7 @@ app.get('/plaid/oauth-redirect', (req, res) => {
 
 app.post('/api/plaid/create-link-token', async (req, res) => {
   if (!requirePlaid(res)) return;
-  const userId = String(req.body.userId || 'payaviator-local-user');
+  const userId = req.bankUserId;
   try {
     const request = {
       user: { client_user_id: userId },
@@ -302,13 +370,13 @@ app.post('/api/plaid/create-link-token', async (req, res) => {
 
 app.get('/api/plaid/hosted-status', async (req, res) => {
   // Compatibility: old app called this without a userId
-  req.params = req.params || {};
-  req.params.userId = 'payaviator-local-user';
+  // Ignore client-selected identity; the bearer token is authoritative.
+  // The authenticated Firebase UID selects the pending Hosted Link.
   return hostedStatusHandler(req, res);
 });
 async function hostedStatusHandler(req, res) {
   if (!requirePlaid(res)) return;
-  const userId = String(req.params.userId || 'payaviator-local-user');
+  const userId = req.bankUserId;
   try {
     const linkToken = await getPending(userId);
     if (!linkToken) {
@@ -406,7 +474,7 @@ async function hostedStatusHandler(req, res) {
 app.post('/api/plaid/exchange-public-token', async (req, res) => {
   if (!requirePlaid(res)) return;
   try {
-    const userId = String(req.body.userId || 'payaviator-local-user');
+    const userId = req.bankUserId;
     if (!req.body.public_token) return res.status(400).json({ error: 'Missing public token.' });
     const out = await exchangeAndStore(userId, req.body.public_token, req.body.metadata || {});
     await clearPending(userId);
@@ -433,16 +501,17 @@ function physicalAccountKey(a, institutionName = '') {
 }
 
 app.get('/api/plaid/accounts', async (req, res) => {
-  req.params = { userId: 'payaviator-local-user' };
+  // The authenticated Firebase UID selects bank accounts or transactions.
   return accountsHandler(req, res);
 });
 app.get('/api/plaid/accounts/:userId', accountsHandler);
 async function accountsHandler(req, res) {
   if (!requirePlaid(res)) return;
   try {
-    const items = await getItems(req.params.userId);
+    const items = await getItems(req.bankUserId);
     if (!items.length) return res.json({ accounts: [], items: [] });
     const accounts = [];
+    const errors = [];
     for (const item of items) {
       try {
         const r = await plaid.accountsGet({ access_token: item.accessToken });
@@ -481,6 +550,12 @@ async function accountsHandler(req, res) {
         }
       } catch (e) {
         console.error('accounts item failed', item.itemId, e.response?.data || e);
+        const details = e?.response?.data || {};
+        errors.push({ item_id: item.itemId,
+          institution_name: item.institutionName || 'Connected institution',
+          code: details.error_code || 'ACCOUNT_REFRESH_FAILED',
+          message: details.error_message || 'A fresh balance is temporarily unavailable.',
+          needs_update: details.error_code === 'ITEM_LOGIN_REQUIRED' });
       }
     }
     const uniqueAccounts = [...new Map(accounts.map(a => [
@@ -490,27 +565,30 @@ async function accountsHandler(req, res) {
     res.json({
       accounts: uniqueAccounts,
       items: items.map(i => ({ item_id: i.itemId, institution_id: i.institutionId, institution_name: i.institutionName })),
+      errors,
     });
   } catch (e) {
     res.status(500).json({ error: 'accounts_failed' });
   }
 }
 
-app.delete('/api/plaid/items/:userId/:itemId', async (req, res) => {
+async function disconnectHandler(req, res) {
   if (!requirePlaid(res)) return;
   try {
-    const items = await getItems(req.params.userId);
+    const items = await getItems(req.bankUserId);
     const item = items.find(x => x.itemId === req.params.itemId);
     if (item) {
       try { await plaid.itemRemove({ access_token: item.accessToken }); }
       catch (e) { console.error('Plaid remove warning', e.response?.data || e); }
-      await delItem(req.params.userId, req.params.itemId);
+      await delItem(req.bankUserId, req.params.itemId);
     }
     res.json({ disconnected: true });
   } catch (e) {
     res.status(500).json({ error: 'disconnect_failed' });
   }
-});
+}
+app.delete('/api/plaid/items/:itemId', disconnectHandler);
+app.delete('/api/plaid/items/:userId/:itemId', disconnectHandler);
 
 
 async function setTransactionsCursor(itemId,cursor){
@@ -554,14 +632,14 @@ async function storedTransactions(userId, limit=250){
 }
 
 app.get('/api/plaid/transactions', async (req, res) => {
-  req.params = { userId: 'payaviator-local-user' };
+  // The authenticated Firebase UID selects bank accounts or transactions.
   return transactionsHandler(req, res);
 });
 app.get('/api/plaid/transactions/:userId', transactionsHandler);
 async function transactionsHandler(req,res){
   if(!requirePlaid(res))return;
   try{
-    const userId=req.params.userId,items=await getItems(userId),errors=[],sync=[];
+    const userId=req.bankUserId,items=await getItems(userId),errors=[],sync=[];
     for(const item of items){
       try{
         let cursor=item.transactionsCursor||null,hasMore=true,addedCount=0,modifiedCount=0,removedCount=0,pages=0;
@@ -585,7 +663,7 @@ async function transactionsHandler(req,res){
 app.get('/api/plaid/transactions-status/:userId', async (req,res)=>{
   if(!requirePlaid(res))return;
   try{
-    const items=await getItems(req.params.userId),status=[];
+    const items=await getItems(req.bankUserId),status=[];
     for(const item of items){
       try{
         const r=await plaid.itemGet({access_token:item.accessToken});
@@ -610,6 +688,6 @@ const port = Number(process.env.PORT || 8787);
 await initStorage();
 app.listen(port, '0.0.0.0', () => {
   console.log(`PayAviator backend ${APP_VERSION} listening on 0.0.0.0:${port}`);
-  console.log(`Plaid ${plaidConfigured ? 'configured' : 'NOT configured'} (${env}); storage=${useDb() ? 'postgres' : 'memory'}`);
+  console.log(`Plaid ${plaidConfigured ? 'configured' : 'NOT configured'} (${env}); storage=${useDb() ? 'postgres' : 'unavailable'}`);
   if (dbError) console.log('Database startup error:', dbError);
 });

@@ -20,3 +20,9 @@ Transactions returned to the app are history/information. The app uses live incl
 
 ## Security
 Keep Plaid secrets and database credentials only in Railway environment variables. Never place secrets in the Android/WebView app.
+
+## 3.1.8 — Stable connected banks
+- Firebase-verified UID scopes every Plaid API call and prevents cross-user access.
+- PostgreSQL is required before creating/linking bank accounts.
+- Saved Plaid items remain listed when one institution's balance refresh fails.
+- Direct item disconnect endpoint supports the PayAviator app.
