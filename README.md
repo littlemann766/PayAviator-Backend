@@ -45,3 +45,12 @@ under the former generic identity or transient memory may require one reconnect.
 - `POST /api/billing/google-play/verify {productId, purchaseToken}` → checks Google Play `purchases.subscriptionsv2.get`, stores an entitlement (sha256 of the token only), acknowledges it. 200 with the status body when active; 402 `subscription_inactive`; 400 `missing_purchase|unknown_product|product_mismatch|invalid_purchase`; 409 `purchase_in_use`; 502 `verify_failed`; 503 `billing_not_configured`.
 - `POST /api/billing/google-play/rtdn` (Pub/Sub push, OIDC bearer verified; needs `GOOGLE_PLAY_RTDN_AUDIENCE`) refreshes known entitlements on renewals/cancels/expiry.
 - Env: see `.env.example` (Google Play section).
+
+### Free-tier anti-abuse (added to PR #8)
+- **New bank links** (`create-link-token`, `exchange-public-token`, hosted-status add mode) require Firebase claim `email_verified === true` → else `403 {"error":"email_not_verified","code":"EMAIL_NOT_VERIFIED"}`. Update mode is not affected.
+- Free users must send header **`X-Device-Id`** (app-generated, 8–256 printable chars, stable per install) on those calls, including hosted-status polling → else `400 device_id_required`. Subscribers don't need it.
+- `402 subscription_required` now may carry `reason`: `device_already_used_free` (this phone already gave another account its free bank) or `account_already_used_free` (this bank account is another account's free bank; the new Item is removed at Plaid and not stored). No `reason` = plain 1-bank limit.
+- `503 free_tier_not_configured` when `FREE_TIER_FINGERPRINT_SECRET` is missing (fail closed; subscribers unaffected; server still starts and logs an error).
+- `X-Play-Integrity-Token` accepted and ignored (follow-up).
+- Only HMAC-SHA256 hashes stored (`free_tier_claims`); 30-day cooldown after bank/account deletion (`FREE_TIER_COOLDOWN_DAYS`), purged on startup + daily. See `docs/PRIVACY-DATA-NOTES.md`.
+- Subscribers skip fingerprint/device checks; grandfathered users' existing banks are untouched.

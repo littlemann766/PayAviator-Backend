@@ -33,16 +33,6 @@ export async function billingSummary(store, userId, now = Date.now()) {
   };
 }
 
-/** Throws a 402-shaped error when adding a new bank would exceed the free limit. */
-export async function assertCanAddBank(store, userId) {
-  const s = await billingSummary(store, userId);
-  if (s.plan === 'free' && s.linkedBanks >= FREE_BANK_LIMIT) {
-    throw Object.assign(new Error('subscription required'), {
-      status: 402, body: { error: 'subscription_required', code: 'SUBSCRIPTION_REQUIRED', limit: FREE_BANK_LIMIT, linked: s.linkedBanks },
-    });
-  }
-}
-
 /** Normalise a subscriptionsv2 resource into our entitlement shape. */
 export function entitlementFromPurchase(p, productId) {
   const lines = Array.isArray(p?.lineItems) ? p.lineItems : [];

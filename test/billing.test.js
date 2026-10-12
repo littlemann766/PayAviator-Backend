@@ -6,13 +6,15 @@ import { buildApp, fakePlaid, testConfig, JWT_SECRET } from './helpers.js';
 import { sha256Hex } from '../src/crypto.js';
 import { ITEM_STATUS } from '../src/plaid.js';
 
-const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({}).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
+const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({ email_verified: true }).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
 const SA = JSON.stringify({ client_email: 'play@x.iam.gserviceaccount.com', private_key: '-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n' });
 const billingConfig = (extra = {}) => testConfig({ GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: SA, ANDROID_PACKAGE_NAME: 'app.payaviator', GOOGLE_PLAY_PRODUCT_IDS: 'payaviator_premium', ...extra });
 const future = (d = 30) => new Date(Date.now() + d * 86400e3).toISOString();
 const linkPlaid = () => fakePlaid({
   linkTokenCreate: async () => ({ link_token: 'link-x' }),
   itemPublicTokenExchange: async ({ public_token }) => ({ item_id: `item-${public_token}`, access_token: `access-${public_token}` }),
+  accountsGet: async ({ access_token }) => ({ item: { institution_id: 'ins_1' }, accounts: [{ account_id: 'a', mask: access_token.slice(-4) }] }),
+  itemRemove: async () => ({}),
 });
 function fakeGoogle(sub) {
   const g = { acks: [], gets: 0,
@@ -27,18 +29,19 @@ test('free user: first bank allowed, second gets 402 on create-link-token and ex
   const plaid = linkPlaid();
   const { app, store } = buildApp({ plaid });
   const auth = await bearer();
-  assert.equal((await request(app).post('/api/plaid/create-link-token').set('Authorization', auth).send({})).status, 200);
-  assert.equal((await request(app).post('/api/plaid/exchange-public-token').set('Authorization', auth).send({ public_token: 'p1' })).status, 200);
-  const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', auth).send({});
+  const post = path => request(app).post(path).set('Authorization', auth).set('X-Device-Id', 'device-test-1');
+  assert.equal((await post('/api/plaid/create-link-token').send({})).status, 200);
+  assert.equal((await post('/api/plaid/exchange-public-token').send({ public_token: 'p1' })).status, 200);
+  const r = await post('/api/plaid/create-link-token').send({});
   assert.equal(r.status, 402);
   assert.deepEqual({ error: r.body.error, limit: r.body.limit, linked: r.body.linked }, { error: 'subscription_required', limit: 1, linked: 1 });
   const before = plaid.calls.filter(c => c.method === 'itemPublicTokenExchange').length;
-  const ex = await request(app).post('/api/plaid/exchange-public-token').set('Authorization', auth).send({ public_token: 'p2' });
+  const ex = await post('/api/plaid/exchange-public-token').send({ public_token: 'p2' });
   assert.equal(ex.status, 402);
   assert.equal(plaid.calls.filter(c => c.method === 'itemPublicTokenExchange').length, before, 'no Plaid exchange over the limit');
   assert.equal((await store.getItems('user-1')).length, 1);
   // Re-sending the already-exchanged token stays idempotent (not blocked).
-  assert.equal((await request(app).post('/api/plaid/exchange-public-token').set('Authorization', auth).send({ public_token: 'p1' })).status, 200);
+  assert.equal((await post('/api/plaid/exchange-public-token').send({ public_token: 'p1' })).status, 200);
 });
 
 test('update mode / relink of an existing item still works at the limit', async () => {
@@ -54,7 +57,7 @@ test('revoked items do not count toward the limit', async () => {
   const { app, store } = buildApp({ plaid: linkPlaid() });
   await store.putItem({ userId: 'user-1', itemId: 'item-1', accessToken: 'a1' });
   await store.revokeItem('item-1');
-  assert.equal((await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).send({})).status, 200);
+  assert.equal((await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).set('X-Device-Id', 'device-test-1').send({})).status, 200);
 });
 
 test('grandfathered user with 2 banks keeps them, can relink, cannot add a third', async () => {

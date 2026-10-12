@@ -10,7 +10,8 @@ export function testConfig(extra = {}) {
   return loadConfig({
     PLAID_ENV: 'sandbox', PLAID_CLIENT_ID: 'cid', PLAID_SECRET: 'sec',
     APP_JWT_SECRET: JWT_SECRET, PLAID_WEBHOOK_URL: 'https://example.com/api/plaid/webhook',
-    PLAID_REDIRECT_URI: 'https://example.com/plaid/oauth-redirect', ...extra,
+    PLAID_REDIRECT_URI: 'https://example.com/plaid/oauth-redirect',
+    FREE_TIER_FINGERPRINT_SECRET: 'test-free-tier-secret-0123456789abcdef', ...extra,
   }).config;
 }
 

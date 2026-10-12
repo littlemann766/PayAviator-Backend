@@ -55,6 +55,14 @@ const webhookVerifier = createWebhookVerifier({
 });
 const syncItem = createSyncer({ store, plaid, log });
 
+if (!config.freeTier.configured) log.error('FREE_TIER_FINGERPRINT_SECRET missing/invalid: free-tier bank links return 503 free_tier_not_configured (subscribers unaffected)');
+// Purge free-tier hashes whose 30-day (FREE_TIER_COOLDOWN_DAYS) cooldown has ended: on startup and daily.
+const purgeFreeTier = () => store.purgeFreeTier(config.freeTier.cooldownDays)
+  .then(n => { if (n) log.info('purged expired free-tier hashes', { count: n }); })
+  .catch(e => log.error('free-tier purge failed', { error_message: e.message }));
+purgeFreeTier();
+setInterval(purgeFreeTier, 24 * 60 * 60 * 1000).unref();
+
 const googlePlay = config.billing.configured ? createGooglePlayClient(config.billing) : null;
 const pubsubVerifier = config.billing.configured && config.billing.rtdnAudience
   ? createPubSubVerifier({ audience: config.billing.rtdnAudience, serviceAccountEmail: config.billing.rtdnServiceAccountEmail })

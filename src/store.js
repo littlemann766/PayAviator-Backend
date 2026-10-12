@@ -80,7 +80,46 @@ export class PgStore {
       created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`);
     await q('CREATE INDEX IF NOT EXISTS billing_entitlements_user_idx ON billing_entitlements(user_id)');
 
+    // Free-tier fingerprints: keyed HMACs only. released_at set when the bank/account is deleted; purged after the cooldown.
+    await q(`CREATE TABLE IF NOT EXISTS free_tier_claims (
+      kind TEXT NOT NULL, hash TEXT NOT NULL, user_id TEXT NOT NULL, item_id TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(), released_at TIMESTAMPTZ,
+      PRIMARY KEY (kind, hash, user_id))`);
+    await q('CREATE INDEX IF NOT EXISTS free_tier_claims_item_idx ON free_tier_claims(item_id)');
+    await q('CREATE INDEX IF NOT EXISTS free_tier_claims_user_idx ON free_tier_claims(user_id)');
+
     await this.encryptLegacyTokens();
+  }
+
+  /** First claim on any of these hashes held by a different user (active or still in cooldown), else null. */
+  async findFreeTierConflict(userId, fps) {
+    if (!fps.length) return null;
+    const r = await this.pool.query(
+      `SELECT kind FROM free_tier_claims WHERE user_id<>$1 AND (kind, hash) IN (SELECT * FROM unnest($2::text[], $3::text[])) LIMIT 1`,
+      [userId, fps.map(f => f.kind), fps.map(f => f.hash)]);
+    return r.rows[0] ? { kind: r.rows[0].kind } : null;
+  }
+
+  async claimFreeTier(userId, itemId, fps) {
+    for (const f of fps) {
+      await this.pool.query(
+        `INSERT INTO free_tier_claims(kind,hash,user_id,item_id) VALUES($1,$2,$3,$4)
+         ON CONFLICT(kind,hash,user_id) DO UPDATE SET item_id=EXCLUDED.item_id, released_at=NULL`,
+        [f.kind, f.hash, userId, itemId]);
+    }
+  }
+
+  async releaseFreeTierItem(itemId, client = this.pool) {
+    await client.query('UPDATE free_tier_claims SET released_at=NOW() WHERE item_id=$1 AND released_at IS NULL', [itemId]);
+  }
+
+  async releaseFreeTierUser(userId, keepItemIds = [], client = this.pool) {
+    await client.query('UPDATE free_tier_claims SET released_at=NOW() WHERE user_id=$1 AND released_at IS NULL AND (item_id IS NULL OR NOT (item_id = ANY($2)))', [userId, keepItemIds]);
+  }
+
+  async purgeFreeTier(cooldownDays) {
+    const r = await this.pool.query(`DELETE FROM free_tier_claims WHERE released_at IS NOT NULL AND released_at < NOW() - make_interval(days => $1::int)`, [Math.floor(cooldownDays)]);
+    return r.rowCount;
   }
 
   async putEntitlement(e) {
@@ -159,6 +198,7 @@ export class PgStore {
       await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('DELETE FROM plaid_pending_links WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('DELETE FROM plaid_items WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
+      await this.releaseFreeTierItem(itemId, client); // keep hashes for the cooldown, then purge
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
@@ -175,6 +215,7 @@ export class PgStore {
       await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE user_id=$1 AND NOT (item_id = ANY($2))', [userId, keepItemIds]);
       await client.query('DELETE FROM plaid_items WHERE user_id=$1 AND NOT (item_id = ANY($2))', [userId, keepItemIds]);
       await client.query('DELETE FROM plaid_pending_links WHERE user_id=$1', [userId]);
+      await this.releaseFreeTierUser(userId, keepItemIds, client);
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {});
@@ -294,6 +335,20 @@ export class MemoryStore {
     this.pending = new Map();
     this.exchanged = new Map();
     this.entitlements = new Map(); // tokenHash -> entitlement
+    this.claims = new Map(); // `${kind}|${hash}|${userId}` -> {kind,hash,userId,itemId,releasedAt}
+  }
+  async findFreeTierConflict(userId, fps) {
+    const want = new Set(fps.map(f => `${f.kind}|${f.hash}`));
+    for (const c of this.claims.values()) if (c.userId !== userId && want.has(`${c.kind}|${c.hash}`)) return { kind: c.kind };
+    return null;
+  }
+  async claimFreeTier(userId, itemId, fps) { for (const f of fps) this.claims.set(`${f.kind}|${f.hash}|${userId}`, { ...f, userId, itemId, releasedAt: null }); }
+  async releaseFreeTierItem(itemId) { for (const c of this.claims.values()) if (c.itemId === itemId && !c.releasedAt) c.releasedAt = Date.now(); }
+  async releaseFreeTierUser(userId, keepItemIds = []) { const k = new Set(keepItemIds); for (const c of this.claims.values()) if (c.userId === userId && !c.releasedAt && !k.has(c.itemId)) c.releasedAt = Date.now(); }
+  async purgeFreeTier(cooldownDays, now = Date.now()) {
+    let n = 0;
+    for (const [k, c] of this.claims) if (c.releasedAt && c.releasedAt < now - cooldownDays * 86400e3) { this.claims.delete(k); n++; }
+    return n;
   }
   async putEntitlement(e) {
     const prev = this.entitlements.get(e.tokenHash);
@@ -322,6 +377,7 @@ export class MemoryStore {
     if (!x || x.user_id !== userId) return;
     this.items.delete(itemId);
     for (const [id, t] of this.transactions) if (t.itemId === itemId) this.transactions.delete(id);
+    await this.releaseFreeTierItem(itemId);
     for (const [h, e] of this.exchanged) if (e.itemId === itemId && e.userId === userId) this.exchanged.delete(h);
     const p = this.pending.get(userId); if (p && p.itemId === itemId) this.pending.delete(userId);
   }
@@ -331,6 +387,7 @@ export class MemoryStore {
     for (const [id, t] of this.transactions) if (t.userId === userId && !keep.has(t.itemId)) this.transactions.delete(id);
     for (const [h, x] of this.exchanged) if (x.userId === userId && !keep.has(x.itemId)) this.exchanged.delete(h);
     this.pending.delete(userId);
+    await this.releaseFreeTierUser(userId, keepItemIds);
   }
   async setItemStatus(itemId, status, errorCode = null) {
     if (status === ITEM_STATUS.REVOKED) return this.revokeItem(itemId, errorCode);

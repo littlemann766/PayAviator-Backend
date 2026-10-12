@@ -154,6 +154,11 @@ export function loadConfig(env = process.env) {
   }
   const androidPackageName = String(env.ANDROID_PACKAGE_NAME || '').trim();
   const playProductIds = list(env.GOOGLE_PLAY_PRODUCT_IDS);
+  let freeTierSecret = String(env.FREE_TIER_FINGERPRINT_SECRET || '');
+  if (freeTierSecret && freeTierSecret.length < 32) { warnings.push('FREE_TIER_FINGERPRINT_SECRET must be at least 32 characters; ignoring it'); freeTierSecret = ''; }
+  if (!freeTierSecret) warnings.push('FREE_TIER_FINGERPRINT_SECRET not set: free-tier bank links fail closed with 503 free_tier_not_configured');
+  const cooldownDays = Number(env.FREE_TIER_COOLDOWN_DAYS || 30);
+  const freeTier = { secret: freeTierSecret || null, configured: Boolean(freeTierSecret), cooldownDays: Number.isFinite(cooldownDays) && cooldownDays >= 0 ? cooldownDays : 30 };
   const billing = {
     configured: Boolean(playServiceAccount && androidPackageName),
     serviceAccount: playServiceAccount,
@@ -192,6 +197,7 @@ export function loadConfig(env = process.env) {
       auth,
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
       billing,
+      freeTier,
       rateLimit: {
         windowMs: 15 * 60 * 1000,
         max: Number(env.RATE_LIMIT_MAX || 300),

@@ -8,13 +8,13 @@ import { MemoryStore } from '../src/store.js';
 import { withRetry } from '../src/retry.js';
 import { silentLog } from '../src/log.js';
 
-const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({}).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
+const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({ email_verified: true }).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
 const plaidErr = (status, error_code, error_type = 'API_ERROR') => Object.assign(new Error(error_code), { response: { status, data: { error_code, error_type, request_id: 'req-1', error_message: 'internal detail' } } });
 
 test('link token uses webhook, redirect_uri, days_requested and user from token', async () => {
   const plaid = fakePlaid({ linkTokenCreate: async () => ({ link_token: 'link-1', hosted_link_url: 'https://hosted' }) });
   const { app } = buildApp({ plaid });
-  const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).send({});
+  const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).set('X-Device-Id', 'device-test-1').send({});
   assert.equal(r.status, 200);
   const req = plaid.calls[0].req;
   assert.equal(req.user.client_user_id, 'user-1');

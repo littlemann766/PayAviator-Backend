@@ -7,7 +7,8 @@ import { requireAuth, enforceUserMatch } from './auth.js';
 import { clientError, plaidErrorInfo, itemErrorCode, statusForItemError, ITEM_STATUS } from './plaid.js';
 import { sha256Hex } from './crypto.js';
 import { handleWebhook } from './webhooks.js';
-import { assertCanAddBank, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
+import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from './freeTier.js';
+import { FREE_BANK_LIMIT, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
 
 /** Items in these states cannot be used until the user completes update mode. */
 const BLOCKED_STATUSES = new Set([ITEM_STATUS.LOGIN_REQUIRED, ITEM_STATUS.REVOKED]);
@@ -71,7 +72,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   app.use(cors({
     origin: (origin, cb) => cb(null, !origin || allowed.has(origin)),
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'X-Device-Id', 'X-Play-Integrity-Token'],
     maxAge: 600,
   }));
   app.use((req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
@@ -233,11 +234,31 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   const linkResponse = d => ({ link_token: d.link_token, hosted_link_url: d.hosted_link_url || null, expiration: d.expiration || null, request_id: d.request_id || null });
 
-  const sendLimit = (res, e) => res.status(402).json(e.body);
+  const isGateError = e => Boolean(e?.body && [400, 402, 403, 503].includes(e.status));
+
+  /**
+   * Checks before a NEW bank link (never update mode): verified email, plan limit, and for the free
+   * tier a per-device slot. X-Play-Integrity-Token is accepted but not yet verified (follow-up).
+   */
+  async function linkGate(req, userId) {
+    if (config.auth?.mode !== 'disabled' && req.authClaims?.email_verified !== true) {
+      throw gateError(403, { error: 'email_not_verified', code: 'EMAIL_NOT_VERIFIED' });
+    }
+    const s = await billingSummary(store, userId);
+    if (s.plan === 'premium') return { free: false };
+    const limitBody = reason => ({ error: 'subscription_required', code: 'SUBSCRIPTION_REQUIRED', limit: FREE_BANK_LIMIT, linked: s.linkedBanks, ...(reason ? { reason } : {}) });
+    if (s.linkedBanks >= FREE_BANK_LIMIT) throw gateError(402, limitBody());
+    if (!config.freeTier?.configured) throw gateError(503, { error: 'free_tier_not_configured', code: 'FREE_TIER_NOT_CONFIGURED' });
+    const deviceId = readDeviceId(req);
+    if (!deviceId) throw gateError(400, { error: 'device_id_required', code: 'DEVICE_ID_REQUIRED' });
+    const device = deviceFingerprint(config.freeTier.secret, deviceId);
+    if (await store.findFreeTierConflict(userId, [device])) throw gateError(402, limitBody('device_already_used_free'));
+    return { free: true, device, limitBody };
+  }
 
   api.post('/plaid/create-link-token', linkLimiter, enforceUserMatch, async (req, res) => {
-    try { await assertCanAddBank(store, req.userId); } catch (e) {
-      if (e.status === 402) return sendLimit(res, e);
+    try { await linkGate(req, req.userId); } catch (e) {
+      if (isGateError(e)) return res.status(e.status).json(e.body);
       log.error('bank limit check failed', { error_message: e.message });
       return res.status(500).json({ error: 'Could not check your plan.', code: 'BILLING_CHECK_FAILED' });
     }
@@ -267,20 +288,36 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     } catch (e) { fail(res, e, 'update link token create failed', 'Could not start reconnecting this bank.', 'LINK_TOKEN_FAILED'); }
   });
 
-  async function exchangeOnce(userId, publicToken, metadata = {}) {
+  async function exchangeOnce(req, userId, publicToken, metadata = {}) {
     const hash = sha256Hex(publicToken);
     const prior = await store.getExchanged(hash);
     if (prior) {
       if (prior.userId !== userId) throw Object.assign(new Error('public token belongs to another user'), { status: 403 });
       return { connected: true, item_id: prior.itemId, institution: metadata?.institution?.name || null, duplicate_exchange: true };
     }
-    await assertCanAddBank(store, userId); // before exchange: no new Plaid Item is created over the limit
+    const gate = await linkGate(req, userId); // before exchange: no new Plaid Item is created over the limit
     const ex = await plaid.call('itemPublicTokenExchange', { public_token: publicToken }, { idempotent: false });
     const institution = metadata?.institution || {};
+    let fps = [];
+    if (gate.free) {
+      // Fingerprint the real accounts BEFORE storing this as the user's free bank.
+      const removeAtPlaid = () => plaid.call('itemRemove', { access_token: ex.access_token })
+        .catch(e => log.error('item remove after free-tier rejection failed', { item_id: ex.item_id, ...plaidErrorInfo(e) }));
+      let acc;
+      try { acc = await plaid.call('accountsGet', { access_token: ex.access_token }); } catch (e) { await removeAtPlaid(); throw e; }
+      const instId = acc?.item?.institution_id || institution.institution_id || institution.id || '';
+      fps = accountFingerprints(config.freeTier.secret, instId, acc?.accounts || []);
+      if (await store.findFreeTierConflict(userId, fps)) {
+        await removeAtPlaid();
+        log.warn('free-tier link rejected: account already used', { user_id: userId });
+        throw gateError(402, gate.limitBody('account_already_used_free'));
+      }
+    }
     await store.putItem({
       userId, itemId: ex.item_id, accessToken: ex.access_token,
       institutionId: institution.institution_id || institution.id || '', institutionName: institution.name || '',
     });
+    if (gate.free) await store.claimFreeTier(userId, ex.item_id, [...fps, gate.device]);
     await store.markExchanged(hash, userId, ex.item_id);
     log.info('item linked', { user_id: userId, item_id: ex.item_id, request_id: ex.request_id });
     return { connected: true, item_id: ex.item_id, institution: institution.name || null };
@@ -336,7 +373,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       for (const r of results) {
         if (!r.publicToken) continue;
         try {
-          connectedItems.push(await exchangeOnce(userId, r.publicToken, r.metadata)); // throws -> pending kept, safe to retry
+          connectedItems.push(await exchangeOnce(req, userId, r.publicToken, r.metadata)); // throws -> pending kept, safe to retry
         } catch (e) {
           if (e.status === 402 && connectedItems.length) { limitHit = e.body; continue; }
           throw e;
@@ -362,9 +399,9 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       return res.json({ connected: false, pending: true, status: 'pending' });
     } catch (e) {
       if (e.status === 403) return res.status(403).json({ error: 'Forbidden.', code: 'USER_MISMATCH' });
-      if (e.status === 402) {
+      if (isGateError(e)) {
         await store.clearPending(userId).catch(() => {});
-        return res.status(402).json({ connected: false, pending: false, status: 'subscription_required', ...e.body });
+        return res.status(e.status).json({ connected: false, pending: false, status: e.body.error, ...e.body });
       }
       const pd = e?.response?.data || {};
       const pmsg = String(pd.error_message || pd.display_message || '');
@@ -381,12 +418,12 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   api.post('/plaid/exchange-public-token', enforceUserMatch, async (req, res) => {
     if (!req.body?.public_token) return res.status(400).json({ error: 'Missing public token.', code: 'MISSING_PUBLIC_TOKEN' });
     try {
-      const out = await exchangeOnce(req.userId, String(req.body.public_token), req.body.metadata || {});
+      const out = await exchangeOnce(req, req.userId, String(req.body.public_token), req.body.metadata || {});
       await store.clearPending(req.userId);
       res.json(out);
     } catch (e) {
       if (e.status === 403) return res.status(403).json({ error: 'Forbidden.', code: 'USER_MISMATCH' });
-      if (e.status === 402) return sendLimit(res, e);
+      if (isGateError(e)) return res.status(e.status).json(e.body);
       fail(res, e, 'public token exchange failed', 'Could not finish connecting this bank.', 'TOKEN_EXCHANGE_FAILED');
     }
   });
