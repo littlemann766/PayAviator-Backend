@@ -36,11 +36,21 @@ test('parseEncryptionKey requires exactly 32 bytes', () => {
 
 test('store keeps tokens encrypted at rest and returns plaintext to the server only', async () => {
   const store = new MemoryStore(key);
-  await store.putItem({ userId: 'u1', itemId: 'i1', accessToken: 'access-sandbox-secret' });
+  const U1 = 'FirebaseUidOwner0000000000A1', U2 = 'FirebaseUidOther0000000000B2';
+  await store.putItem({ userId: U1, itemId: 'i1', accessToken: 'access-sandbox-secret' });
   assert.ok(isEncrypted(store.items.get('i1').access_token));
-  assert.equal((await store.getItems('u1'))[0].accessToken, 'access-sandbox-secret');
-  // Another user cannot take over an existing item_id.
-  await store.putItem({ userId: 'u2', itemId: 'i1', accessToken: 'access-sandbox-other' });
-  assert.equal((await store.getItems('u1')).length, 1);
-  assert.equal((await store.getItems('u2')).length, 0);
+  assert.equal((await store.getItems(U1))[0].accessToken, 'access-sandbox-secret');
+  // Another Firebase user cannot take over an existing item_id.
+  await store.putItem({ userId: U2, itemId: 'i1', accessToken: 'access-sandbox-other' });
+  assert.equal((await store.getItems(U1)).length, 1);
+  assert.equal((await store.getItems(U2)).length, 0);
+});
+
+test('an item held by a legacy (pre-Firebase) identity moves to the verified user on relink', async () => {
+  const store = new MemoryStore(key);
+  const U = 'FirebaseUidOwner0000000000A1';
+  await store.putItem({ userId: 'payaviator-local-user', itemId: 'i9', accessToken: 'access-old' });
+  await store.putItem({ userId: U, itemId: 'i9', accessToken: 'access-new' });
+  assert.equal((await store.getItems('payaviator-local-user')).length, 0);
+  assert.equal((await store.getItems(U))[0].accessToken, 'access-new');
 });

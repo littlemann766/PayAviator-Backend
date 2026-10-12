@@ -260,6 +260,13 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       return res.json({ connected: false, pending: true, status: 'pending' });
     } catch (e) {
       if (e.status === 403) return res.status(403).json({ error: 'Forbidden.', code: 'USER_MISMATCH' });
+      const pd = e?.response?.data || {};
+      const pmsg = String(pd.error_message || pd.display_message || '');
+      if (['INVALID_LINK_TOKEN', 'INVALID_PUBLIC_TOKEN'].includes(pd.error_code) || /expired|invalid.*token/i.test(pmsg)) {
+        await store.clearPending(userId).catch(() => {});
+        log.warn('hosted link expired; pending cleared', { user_id: userId, ...plaidErrorInfo(e) });
+        return res.json({ connected: false, pending: false, status: 'expired', error: 'The previous bank connection expired. Tap Connect again to start a fresh one.', plaid_error_code: pd.error_code || 'INVALID_LINK_TOKEN' });
+      }
       log.error('hosted status failed', { user_id: userId, ...plaidErrorInfo(e) });
       res.status(502).json({ connected: false, pending: true, status: 'error', ...clientError(e, 'Could not read the bank connection result. Please try again.', 'HOSTED_STATUS_FAILED') });
     }
@@ -294,7 +301,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       if (!items.length) return res.json({ accounts: [], items: [], errors: [] });
       const accounts = [], errors = [];
       for (const item of items) {
-        if (BLOCKED_STATUSES.has(item.status)) { errors.push({ item_id: item.itemId, code: item.errorCode || item.status, needs_update: true }); continue; }
+        if (BLOCKED_STATUSES.has(item.status)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: item.errorCode || item.status, message: 'Reconnect this bank to refresh its balance.', needs_update: true }); continue; }
         try {
           const d = await plaid.call('accountsGet', { access_token: item.accessToken });
           for (const a of d.accounts) accounts.push(decorateAccount(a, item));
@@ -302,7 +309,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
           const code = itemErrorCode(e);
           if (code) { item.status = statusForItemError(code, e?.response?.data?.error_code_reason); item.errorCode = code; await store.setItemStatus(item.itemId, item.status, code); }
           log.error('accounts get failed', { item_id: item.itemId, ...plaidErrorInfo(e) });
-          errors.push({ item_id: item.itemId, code: code || 'ACCOUNTS_FAILED', needs_update: Boolean(code && item.status === ITEM_STATUS.LOGIN_REQUIRED) });
+          errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: code || 'ACCOUNTS_FAILED', message: e?.response?.data?.error_message || 'A fresh balance is temporarily unavailable.', needs_update: Boolean(code && item.status === ITEM_STATUS.LOGIN_REQUIRED) });
         }
       }
       const uniqueAccounts = [...new Map(accounts.map(a => [physicalAccountKey(a, a.institution_name), a])).values()];

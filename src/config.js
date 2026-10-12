@@ -144,7 +144,7 @@ export function loadConfig(env = process.env) {
 
   return {
     config: {
-      appVersion: '3.2.0',
+      appVersion: '4.0.0',
       port: Number(env.PORT || 8787),
       trustProxy: env.TRUST_PROXY === undefined ? 1 : (Number.isNaN(Number(env.TRUST_PROXY)) ? env.TRUST_PROXY : Number(env.TRUST_PROXY)),
       isProduction,
@@ -166,7 +166,7 @@ export function loadConfig(env = process.env) {
       db: databaseUrl ? { url: databaseUrl, ssl } : null,
       tokenEncryptionKey,
       auth,
-      corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net'],
+      corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
       rateLimit: {
         windowMs: 15 * 60 * 1000,
         max: Number(env.RATE_LIMIT_MAX || 300),

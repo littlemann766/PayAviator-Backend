@@ -2,6 +2,7 @@ import pg from 'pg';
 import crypto from 'node:crypto';
 import { encryptToken, decryptToken, isEncrypted, TOKEN_PREFIX } from './crypto.js';
 import { ITEM_STATUS } from './plaid.js';
+import { isLegacyUserId } from './legacy.js';
 
 function rowToItem(x, key) {
   return {
@@ -99,10 +100,11 @@ export class PgStore {
       `INSERT INTO plaid_items(user_id,item_id,access_token,institution_id,institution_name,status,error_code,status_updated_at)
        VALUES($1,$2,$3,$4,$5,'${ITEM_STATUS.GOOD}',NULL,NOW())
        ON CONFLICT(item_id) DO UPDATE SET
+         user_id=EXCLUDED.user_id,
          access_token=EXCLUDED.access_token, institution_id=EXCLUDED.institution_id,
          institution_name=EXCLUDED.institution_name, status=EXCLUDED.status, error_code=NULL,
          status_updated_at=NOW(), updated_at=NOW()
-       WHERE plaid_items.user_id=EXCLUDED.user_id`,
+       WHERE plaid_items.user_id=EXCLUDED.user_id OR plaid_items.user_id !~ '^[A-Za-z0-9]{20,128}$'`,
       [x.userId, x.itemId, encryptToken(x.accessToken, this.key), x.institutionId || null, x.institutionName || null]);
   }
 
@@ -263,7 +265,7 @@ export class MemoryStore {
   async init() {}
   async putItem(x) {
     const existing = this.items.get(x.itemId);
-    if (existing && existing.user_id !== x.userId) return;
+    if (existing && existing.user_id !== x.userId && !isLegacyUserId(existing.user_id)) return;
     this.items.set(x.itemId, {
       ...(existing || { created_at: Date.now(), transactions_cursor: null, new_accounts_available: false }),
       user_id: x.userId, item_id: x.itemId, access_token: encryptToken(x.accessToken, this.key),

@@ -1,4 +1,4 @@
-# PayAviator Backend Authority (backend 3.2.0)
+# PayAviator Backend Authority (backend 4.0.0)
 
 This is the single deployment authority for the PayAviator banking backend.
 
@@ -115,3 +115,12 @@ They never contain access/public/link tokens, the Plaid secret, Authorization he
 their type, not the message, because parser messages can echo the request body.
 Railway retains these logs for the period of the workspace's plan (see Railway's pricing/plan docs). Mention this in the privacy
 policy's "service providers / logs" section.
+
+## Security
+Keep Plaid secrets and database credentials only in Railway environment variables. Never place secrets in the Android/WebView app.
+
+## 3.1.8 — Stable connected banks
+- Firebase-verified UID scopes every Plaid API call and prevents cross-user access.
+- PostgreSQL is required before creating/linking bank accounts.
+- Saved Plaid items remain listed when one institution's balance refresh fails.
+- Direct item disconnect endpoint supports the PayAviator app.

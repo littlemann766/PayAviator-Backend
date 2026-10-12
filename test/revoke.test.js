@@ -106,7 +106,7 @@ test('API after revocation: item listed as revoked with needs_update; reconnect 
   const summary = acc.body.items.find(i => i.item_id === 'item-r');
   assert.equal(summary.status, 'revoked'); assert.equal(summary.needs_update, true);
   assert.equal(summary.institution_name, 'PNC');
-  assert.deepEqual(acc.body.errors, [{ item_id: 'item-r', code: 'USER_PERMISSION_REVOKED', needs_update: true }]);
+  assert.deepEqual(acc.body.errors, [{ item_id: 'item-r', institution_name: 'PNC', code: 'USER_PERMISSION_REVOKED', message: 'Reconnect this bank to refresh its balance.', needs_update: true }]);
 
   const tx = await request(app).get('/api/plaid/transactions').set('Authorization', await bearer());
   assert.ok(!tx.body.transactions.some(t => t.item_id === 'item-r' || t.transaction_id === 't-r'));

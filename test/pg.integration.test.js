@@ -26,10 +26,20 @@ test('PgStore: legacy plaintext migration is idempotent; CRUD works', { skip: !u
   assert.equal((await store.getItems('u1'))[0].accessToken, 'access-sandbox-legacy');
   assert.equal((await store.getItems('u1'))[0].status, 'good');
 
+  // A Firebase-owned item cannot be taken over by another user...
+  const OWNER = 'FirebaseUidOwner0000000000A1';
+  await store.putItem({ userId: OWNER, itemId: 'i3', accessToken: 'access-sandbox-3' });
+  await store.putItem({ userId: 'FirebaseUidAttacker00000000B2', itemId: 'i3', accessToken: 'access-sandbox-evil' });
+  assert.equal((await store.getItemById('i3')).userId, OWNER);
+  assert.equal((await store.getItemById('i3')).accessToken, 'access-sandbox-3');
+  // ...but an item held by a legacy (pre-Firebase) id moves to the verified user on relink.
   await store.putItem({ userId: 'u1', itemId: 'i2', accessToken: 'access-sandbox-2', institutionName: 'Bank' });
-  await store.putItem({ userId: 'attacker', itemId: 'i2', accessToken: 'access-sandbox-evil' });
-  assert.equal((await store.getItemById('i2')).userId, 'u1');
-  assert.equal((await store.getItemById('i2')).accessToken, 'access-sandbox-2');
+  await store.putItem({ userId: OWNER, itemId: 'i2', accessToken: 'access-sandbox-moved' });
+  assert.equal((await store.getItemById('i2')).userId, OWNER);
+  await store.putItem({ userId: 'u1', itemId: 'i2', accessToken: 'access-sandbox-2', institutionName: 'Bank' });
+  assert.equal((await store.getItemById('i2')).userId, OWNER, 'cannot move back to a legacy id');
+  await store.deleteItem(OWNER, 'i3');
+  await raw.query(`UPDATE plaid_items SET user_id='u1', access_token=$1 WHERE item_id='i2'`, [(await raw.query(`SELECT access_token FROM plaid_items WHERE item_id='legacy-item'`)).rows[0].access_token]);
 
   await store.setItemStatus('i2', 'login_required', 'ITEM_LOGIN_REQUIRED');
   await store.setNewAccountsAvailable('i2', true);
