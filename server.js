@@ -378,7 +378,20 @@ async function hostedStatusHandler(req, res) {
     return res.json({ connected: false, pending: true, status: 'pending' });
   } catch (e) {
     const d = e?.response?.data || {};
+    const code = d?.error_code || '';
+    const msg = d?.error_message || d?.display_message || e?.message || '';
     console.error('Hosted Link status error:', d || e);
+    // Expired / invalid token: clear it so the next Connect starts fresh
+    if (code === 'INVALID_PUBLIC_TOKEN' || /expired|invalid.*token/i.test(msg)) {
+      try { await clearPending(userId); } catch (_) {}
+      return res.json({
+        connected: false,
+        pending: false,
+        status: 'expired',
+        error: 'The previous bank connection expired. Tap Connect again to start a fresh one.',
+        plaid_error_code: code || 'INVALID_PUBLIC_TOKEN',
+      });
+    }
     res.status(500).json({
       connected: false,
       pending: false,
