@@ -7,6 +7,7 @@ import { createWebhookVerifier } from './src/webhookVerify.js';
 import { PgStore, MemoryStore } from './src/store.js';
 import { createSyncer } from './src/sync.js';
 import { createApp } from './src/app.js';
+import { createGooglePlayClient, createPubSubVerifier } from './src/billing.js';
 
 let config, warnings;
 try {
@@ -54,8 +55,14 @@ const webhookVerifier = createWebhookVerifier({
 });
 const syncItem = createSyncer({ store, plaid, log });
 
+const googlePlay = config.billing.configured ? createGooglePlayClient(config.billing) : null;
+const pubsubVerifier = config.billing.configured && config.billing.rtdnAudience
+  ? createPubSubVerifier({ audience: config.billing.rtdnAudience, serviceAccountEmail: config.billing.rtdnServiceAccountEmail })
+  : null;
+if (!googlePlay) log.warn('billing_not_configured: /api/billing/google-play/* return 503; free one-bank limit still enforced');
+
 const app = createApp({
-  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log,
+  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier,
   health: () => ({ storage: storageKind, databaseReady: dbReady }),
 });
 

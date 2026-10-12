@@ -140,6 +140,30 @@ export function loadConfig(env = process.env) {
 
   const corsOrigins = list(env.CORS_ORIGINS);
 
+  // --- Google Play billing (optional: missing/invalid => billing endpoints 503, free limit still enforced) ---
+  let playServiceAccount = null;
+  if (env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON) {
+    try {
+      const raw = String(env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON).trim();
+      playServiceAccount = JSON.parse(raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8'));
+      if (!playServiceAccount.client_email || !playServiceAccount.private_key) throw new Error('missing client_email/private_key');
+    } catch (e) {
+      playServiceAccount = null;
+      warnings.push(`GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is invalid (${e.message}); Google Play billing disabled`);
+    }
+  }
+  const androidPackageName = String(env.ANDROID_PACKAGE_NAME || '').trim();
+  const playProductIds = list(env.GOOGLE_PLAY_PRODUCT_IDS);
+  const billing = {
+    configured: Boolean(playServiceAccount && androidPackageName),
+    serviceAccount: playServiceAccount,
+    packageName: androidPackageName || null,
+    productIds: playProductIds,
+    rtdnAudience: env.GOOGLE_PLAY_RTDN_AUDIENCE || null,
+    rtdnServiceAccountEmail: env.GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT || null,
+  };
+  if (isProduction && !billing.configured) warnings.push('Google Play billing not configured (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON + ANDROID_PACKAGE_NAME); second bank links will be refused');
+
   if (errors.length) throw new ConfigError(errors);
 
   return {
@@ -167,6 +191,7 @@ export function loadConfig(env = process.env) {
       tokenEncryptionKey,
       auth,
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
+      billing,
       rateLimit: {
         windowMs: 15 * 60 * 1000,
         max: Number(env.RATE_LIMIT_MAX || 300),

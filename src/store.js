@@ -19,6 +19,11 @@ function rowToItem(x, key) {
   };
 }
 
+function rowToEnt(x) {
+  return { tokenHash: x.purchase_token_hash, userId: x.user_id, productId: x.product_id, platform: x.platform,
+    state: x.state, expiresAt: x.expires_at ? new Date(x.expires_at).toISOString() : null };
+}
+
 // sslmode/sslrootcert in the connection string override pg's `ssl` option, so
 // strip them and let DATABASE_SSL_* / PGSSL control TLS explicitly.
 export function stripSslParams(url) {
@@ -68,7 +73,34 @@ export class PgStore {
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW())`);
 
+    // Paid entitlements (Google Play subscriptions). Only a sha256 of the purchase token is stored.
+    await q(`CREATE TABLE IF NOT EXISTS billing_entitlements (
+      purchase_token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, product_id TEXT NOT NULL,
+      platform TEXT NOT NULL DEFAULT 'google_play', state TEXT NOT NULL, expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    await q('CREATE INDEX IF NOT EXISTS billing_entitlements_user_idx ON billing_entitlements(user_id)');
+
     await this.encryptLegacyTokens();
+  }
+
+  async putEntitlement(e) {
+    await this.pool.query(
+      `INSERT INTO billing_entitlements(purchase_token_hash,user_id,product_id,platform,state,expires_at)
+       VALUES($1,$2,$3,$4,$5,$6)
+       ON CONFLICT(purchase_token_hash) DO UPDATE SET product_id=EXCLUDED.product_id, state=EXCLUDED.state,
+         expires_at=EXCLUDED.expires_at, updated_at=NOW()
+       WHERE billing_entitlements.user_id=EXCLUDED.user_id`,
+      [e.tokenHash, e.userId, e.productId, e.platform || 'google_play', e.state, e.expiresAt || null]);
+  }
+
+  async getEntitlementByTokenHash(h) {
+    const r = await this.pool.query('SELECT * FROM billing_entitlements WHERE purchase_token_hash=$1', [h]);
+    return r.rows[0] ? rowToEnt(r.rows[0]) : null;
+  }
+
+  async getEntitlements(userId) {
+    const r = await this.pool.query('SELECT * FROM billing_entitlements WHERE user_id=$1', [userId]);
+    return r.rows.map(rowToEnt);
   }
 
   /** One-time, idempotent: encrypt any access_token not yet carrying the enc:v1: prefix. */
@@ -261,7 +293,15 @@ export class MemoryStore {
     this.transactions = new Map(); // transactionId -> {userId,itemId,payload,removed}
     this.pending = new Map();
     this.exchanged = new Map();
+    this.entitlements = new Map(); // tokenHash -> entitlement
   }
+  async putEntitlement(e) {
+    const prev = this.entitlements.get(e.tokenHash);
+    if (prev && prev.userId !== e.userId) return;
+    this.entitlements.set(e.tokenHash, { tokenHash: e.tokenHash, userId: e.userId, productId: e.productId, platform: e.platform || 'google_play', state: e.state, expiresAt: e.expiresAt || null });
+  }
+  async getEntitlementByTokenHash(h) { const e = this.entitlements.get(h); return e ? { ...e } : null; }
+  async getEntitlements(userId) { return [...this.entitlements.values()].filter(e => e.userId === userId).map(e => ({ ...e })); }
   async init() {}
   async putItem(x) {
     const existing = this.items.get(x.itemId);

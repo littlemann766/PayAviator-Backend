@@ -44,6 +44,7 @@ test('hosted-status exchanges each public token once across all sessions', async
     itemPublicTokenExchange: async ({ public_token }) => { n++; if (public_token === 'public-b' && n === 2) throw plaidErr(500, 'INTERNAL_SERVER_ERROR'); return { item_id: `item-${public_token}`, access_token: `access-${public_token}` }; },
   });
   const { app, store } = buildApp({ plaid });
+  await store.putEntitlement({ tokenHash: 'h', userId: 'user-1', productId: 'premium', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: new Date(Date.now() + 86400e3).toISOString() }); // two banks needs a plan
   await store.putPending('user-1', 'link-1');
   const first = await request(app).get('/api/plaid/hosted-status').set('Authorization', await bearer());
   assert.equal(first.status, 502);
