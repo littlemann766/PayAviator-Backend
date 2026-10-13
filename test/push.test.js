@@ -75,6 +75,36 @@ test('POST/DELETE /api/devices/fcm: auth, validation, upsert, cap, unregister', 
   assert.equal((await request(app).delete('/api/devices/fcm').set('Authorization', auth).send({})).status, 400);
 });
 
+test('DELETE /api/devices/fcm: accepts ?token= when body has none; still owner-only', async () => {
+  const store = new MemoryStore();
+  const { app } = buildApp({ store });
+  const auth = `Bearer ${await sign('user-1')}`;
+  const auth2 = `Bearer ${await sign('user-2')}`;
+  const tok = fakeToken(9);
+  await request(app).post('/api/devices/fcm').set('Authorization', auth).send({ token: tok });
+  // query-only unregister
+  const delQ = await request(app).delete(`/api/devices/fcm?token=${encodeURIComponent(tok)}`).set('Authorization', auth);
+  assert.equal(delQ.status, 200);
+  assert.deepEqual(delQ.body, { unregistered: true, removed: true });
+  assert.deepEqual(await store.getFcmTokens('user-1'), []);
+  // re-register, then other user cannot remove via query
+  await request(app).post('/api/devices/fcm').set('Authorization', auth).send({ token: tok });
+  assert.equal((await request(app).delete(`/api/devices/fcm?token=${encodeURIComponent(tok)}`).set('Authorization', auth2)).body.removed, false);
+  assert.deepEqual(await store.getFcmTokens('user-1'), [tok]);
+  // body wins over query when both present
+  const other = fakeToken(8);
+  await request(app).post('/api/devices/fcm').set('Authorization', auth).send({ token: other });
+  const delBoth = await request(app).delete(`/api/devices/fcm?token=${encodeURIComponent(tok)}`).set('Authorization', auth).send({ token: other });
+  assert.equal(delBoth.status, 200);
+  assert.equal(delBoth.body.removed, true);
+  assert.ok((await store.getFcmTokens('user-1')).includes(tok), 'query token not removed when body token present');
+  assert.ok(!(await store.getFcmTokens('user-1')).includes(other));
+  // empty body + missing query still 400
+  assert.equal((await request(app).delete('/api/devices/fcm').set('Authorization', auth).send({})).status, 400);
+  // invalid query token
+  assert.equal((await request(app).delete('/api/devices/fcm?token=nope').set('Authorization', auth)).status, 400);
+});
+
 test('device routes work even when Plaid is not configured', async () => {
   const { app } = buildApp({ config: testConfig({ PLAID_CLIENT_ID: '', PLAID_SECRET: '' }) });
   const r = await request(app).post('/api/devices/fcm').set('Authorization', `Bearer ${await sign('u')}`).send({ token: fakeToken() });

@@ -230,7 +230,8 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   });
 
   devices.delete('/fcm', async (req, res) => {
-    const token = req.body?.token;
+    // Prefer JSON body; fall back to ?token= when the body has no token (common for DELETE clients).
+    const token = req.body?.token ?? req.query?.token;
     if (!isValidFcmToken(token)) return badToken(res);
     try {
       const removed = await store.deleteFcmToken(req.userId, token);

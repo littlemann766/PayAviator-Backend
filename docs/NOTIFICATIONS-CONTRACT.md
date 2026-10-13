@@ -15,7 +15,7 @@ Request: `{"token": "<FCM registration token>", "platform": "android" | "ios" | 
 200: `{"registered": true, "devices": <n>, "max_devices": 10, "push_configured": <bool>}`
 
 ### DELETE /api/devices/fcm
-Request: `{"token": "<FCM registration token>"}`. Call it before sign-out, while the ID token is still valid.
+Request: `{"token": "<FCM registration token>"}`, or the same value as a query parameter (`?token=`) when the JSON body has none. Call it before sign-out, while the ID token is still valid. The body wins if both are present. A user can only remove their own tokens (`removed` is false for someone else's).
 200: `{"unregistered": true, "removed": <bool>}`. The response is always 200, even when the token wasn't registered or belongs to another user, in which case `removed` is false.
 
 ### Errors
