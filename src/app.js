@@ -7,6 +7,10 @@ import { requireAuth, enforceUserMatch } from './auth.js';
 import { clientError, plaidErrorInfo, itemErrorCode, statusForItemError, ITEM_STATUS } from './plaid.js';
 import { sha256Hex } from './crypto.js';
 import { handleWebhook } from './webhooks.js';
+import { plaidContextMiddleware } from './plaidLog.js';
+import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from './freeTier.js';
+import { checkVerdict } from './integrity.js';
+import { FREE_BANK_LIMIT, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
 
 /** Items in these states cannot be used until the user completes update mode. */
 const BLOCKED_STATUSES = new Set([ITEM_STATUS.LOGIN_REQUIRED, ITEM_STATUS.REVOKED]);
@@ -60,7 +64,7 @@ function decorateAccount(a, item) {
   };
 }
 
-export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}) }) {
+export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -70,7 +74,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   app.use(cors({
     origin: (origin, cb) => cb(null, !origin || allowed.has(origin)),
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'X-Device-Id', 'X-Play-Integrity-Token', 'X-Link-Session-Id'],
     maxAge: 600,
   }));
   app.use((req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
@@ -112,11 +116,100 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     }
   });
 
+  // ---------- Google Play Real-time Developer Notifications (Pub/Sub push; public, OIDC-verified) ----------
+  const summaryOpts = { compUids: config.billing?.compUids || new Set() };
+  const billingReady = () => Boolean(config.billing?.configured && googlePlay);
+  const notConfigured = res => res.status(503).json({ error: 'billing_not_configured', code: 'BILLING_NOT_CONFIGURED' });
+
+  /** Fetch a purchase from Google, store it for userId, acknowledge if needed. Returns the entitlement. */
+  async function refreshPurchase({ userId, productId, purchaseToken }) {
+    const p = await googlePlay.getSubscription(purchaseToken);
+    const ent = entitlementFromPurchase(p, productId);
+    const tokenHash = sha256Hex(purchaseToken);
+    await store.putEntitlement({ tokenHash, userId, productId, state: ent.state, expiresAt: ent.expiresAt });
+    // An upgrade/resubscribe replaces the old token: mark the old one superseded.
+    if (ent.linkedPurchaseToken) {
+      const old = await store.getEntitlementByTokenHash(sha256Hex(ent.linkedPurchaseToken));
+      if (old && old.userId === userId) await store.putEntitlement({ ...old, state: 'SUPERSEDED' });
+    }
+    return { ...ent, tokenHash };
+  }
+
+  app.post('/api/billing/google-play/rtdn', publicLimiter, express.json({ limit: '100kb' }), async (req, res) => {
+    if (!billingReady() || !pubsubVerifier) return notConfigured(res);
+    try { await pubsubVerifier(req.get('authorization')); } catch (e) {
+      log.warn('rtdn rejected', { reason: e.message });
+      return res.status(401).json({ error: 'invalid_push', code: 'INVALID_PUSH' });
+    }
+    let n;
+    try { n = JSON.parse(Buffer.from(String(req.body?.message?.data || ''), 'base64').toString('utf8')); } catch { n = null; }
+    const sub = n?.subscriptionNotification;
+    // Ack (2xx) anything we do not act on so Pub/Sub stops redelivering it.
+    if (!sub?.purchaseToken || n.packageName !== config.billing.packageName) return res.status(204).end();
+    try {
+      const known = await store.getEntitlementByTokenHash(sha256Hex(sub.purchaseToken));
+      if (!known) return res.status(204).end(); // not yet claimed by a user via /verify
+      const ent = await refreshPurchase({ userId: known.userId, productId: sub.subscriptionId || known.productId, purchaseToken: sub.purchaseToken });
+      log.info('rtdn processed', { notification_type: sub.notificationType, state: ent.state });
+      res.status(204).end();
+    } catch (e) {
+      log.error('rtdn processing failed', { error_message: e.message });
+      res.status(500).json({ error: 'rtdn_failed' }); // Pub/Sub will retry.
+    }
+  });
+
+  // ---------- Billing API (signed-in) ----------
+  const billing = express.Router();
+  billing.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max, standardHeaders: 'draft-8', legacyHeaders: false }));
+  billing.use(express.json({ limit: '100kb' }));
+  billing.use(requireAuth(tokenVerifier, { log }));
+
+  billing.get('/status', async (req, res) => {
+    try {
+      const s = await billingSummary(store, req.userId, Date.now(), summaryOpts);
+      res.json({ ...s, billingConfigured: billingReady() });
+    } catch (e) {
+      log.error('billing status failed', { error_message: e.message });
+      res.status(500).json({ error: 'Could not load plan.', code: 'BILLING_STATUS_FAILED' });
+    }
+  });
+
+  billing.post('/google-play/verify', async (req, res) => {
+    if (!billingReady()) return notConfigured(res);
+    const productId = typeof req.body?.productId === 'string' ? req.body.productId.trim() : '';
+    const purchaseToken = typeof req.body?.purchaseToken === 'string' ? req.body.purchaseToken.trim() : '';
+    if (!productId || !purchaseToken || purchaseToken.length > 4096 || productId.length > 200) return res.status(400).json({ error: 'missing_purchase', code: 'MISSING_PURCHASE' });
+    if (config.billing.productIds.length && !config.billing.productIds.includes(productId)) return res.status(400).json({ error: 'unknown_product', code: 'UNKNOWN_PRODUCT' });
+    try {
+      const owner = await store.getEntitlementByTokenHash(sha256Hex(purchaseToken));
+      if (owner && owner.userId !== req.userId) return res.status(409).json({ error: 'purchase_in_use', code: 'PURCHASE_IN_USE' });
+      const ent = await refreshPurchase({ userId: req.userId, productId, purchaseToken });
+      if (!ent.productMatches) return res.status(400).json({ error: 'product_mismatch', code: 'PRODUCT_MISMATCH' });
+      const active = isEntitlementActive(ent);
+      if (active && !ent.acknowledged) {
+        // Google refunds unacknowledged purchases after 3 days; failure here is retried on the next verify.
+        try { await googlePlay.acknowledge(productId, purchaseToken); } catch (e) { log.error('purchase acknowledge failed', { error_message: e.message }); }
+      }
+      res.status(active ? 200 : 402).json({
+        ...(active ? {} : { error: 'subscription_inactive', code: 'SUBSCRIPTION_INACTIVE' }),
+        ...(await billingSummary(store, req.userId, Date.now(), summaryOpts)), subscriptionState: ent.state,
+      });
+    } catch (e) {
+      const st = e?.response?.status || e?.status;
+      if (st === 400 || st === 404 || st === 410) return res.status(400).json({ error: 'invalid_purchase', code: 'INVALID_PURCHASE' });
+      log.error('google play verify failed', { status: st, error_message: e.message });
+      res.status(502).json({ error: 'verify_failed', code: 'VERIFY_FAILED' });
+    }
+  });
+
+  app.use('/api/billing', billing);
+
   // ---------- Authenticated API ----------
   const api = express.Router();
   api.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max * 2, standardHeaders: 'draft-8', legacyHeaders: false })); // per-IP, before auth
   api.use(express.json({ limit: '100kb' }));
   api.use(requireAuth(tokenVerifier, { log }));
+  api.use(plaidContextMiddleware); // user_ref + optional link_session_id on every Plaid log line
   const userKey = req => req.userId || ipKeyGenerator(req.ip);
   api.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max, keyGenerator: userKey, standardHeaders: 'draft-8', legacyHeaders: false }));
   const linkLimiter = rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.linkMax, keyGenerator: userKey, standardHeaders: 'draft-8', legacyHeaders: false });
@@ -145,7 +238,53 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   const linkResponse = d => ({ link_token: d.link_token, hosted_link_url: d.hosted_link_url || null, expiration: d.expiration || null, request_id: d.request_id || null });
 
+  const isGateError = e => Boolean(e?.body && [400, 402, 403, 503].includes(e.status));
+
+  /**
+   * Checks before a NEW bank link (never update mode): verified email, plan limit, and for the free
+   * tier a per-device slot (ANDROID_ID, HMAC'd) and, when PLAY_INTEGRITY_ENFORCE=true, a valid
+   * Play Integrity verdict bound to sha256(androidId|uid). Subscribers skip all of it.
+   */
+  async function checkIntegrity(req, deviceId, userId) {
+    if (!config.integrity.configured || !integrity) throw gateError(503, { error: 'integrity_not_configured', code: 'INTEGRITY_NOT_CONFIGURED' });
+    const deny = reason => gateError(403, { error: 'integrity_failed', code: 'INTEGRITY_FAILED', reason });
+    const token = String(req.get('x-play-integrity-token') || '').trim();
+    if (!token) throw deny('token_missing');
+    if (token.length > 8192) throw deny('token_invalid');
+    let payload;
+    try { payload = await integrity.decode(token); } catch (e) {
+      log.warn('integrity decode failed', { user_id: userId, error_message: e.message });
+      throw deny('token_invalid');
+    }
+    const reason = checkVerdict(payload, { packageName: config.integrity.packageName, deviceId, uid: userId });
+    if (reason) { log.warn('integrity check failed', { user_id: userId, reason }); throw deny(reason); }
+  }
+
+  async function linkGate(req, userId) {
+    if (config.auth?.mode !== 'disabled' && req.authClaims?.email_verified !== true) {
+      throw gateError(403, { error: 'email_not_verified', code: 'EMAIL_NOT_VERIFIED' });
+    }
+    const s = await billingSummary(store, userId, Date.now(), summaryOpts);
+    if (s.plan === 'premium' || s.plan === 'comp') return { free: false }; // comp/owner: no limit, no device/fingerprint/integrity, no claim
+    const limitBody = reason => ({ error: 'subscription_required', code: 'SUBSCRIPTION_REQUIRED', limit: FREE_BANK_LIMIT, linked: s.linkedBanks, ...(reason ? { reason } : {}) });
+    if (s.linkedBanks >= FREE_BANK_LIMIT) throw gateError(402, limitBody());
+    if (!config.freeTier?.configured) throw gateError(503, { error: 'free_tier_not_configured', code: 'FREE_TIER_NOT_CONFIGURED' });
+    const dev = readDeviceId(req);
+    if (dev.missing) throw gateError(400, { error: 'device_id_required', code: 'DEVICE_ID_REQUIRED' });
+    if (dev.invalid) throw gateError(400, { error: 'device_id_invalid', code: 'DEVICE_ID_INVALID' });
+    const deviceId = dev.id;
+    if (config.integrity?.enforce) await checkIntegrity(req, deviceId, userId);
+    const device = deviceFingerprint(config.freeTier.secret, deviceId);
+    if (await store.findFreeTierConflict(userId, [device])) throw gateError(402, limitBody('device_already_used_free'));
+    return { free: true, device, limitBody };
+  }
+
   api.post('/plaid/create-link-token', linkLimiter, enforceUserMatch, async (req, res) => {
+    try { await linkGate(req, req.userId); } catch (e) {
+      if (isGateError(e)) return res.status(e.status).json(e.body);
+      log.error('bank limit check failed', { error_message: e.message });
+      return res.status(500).json({ error: 'Could not check your plan.', code: 'BILLING_CHECK_FAILED' });
+    }
     try {
       const d = await plaid.call('linkTokenCreate', linkTokenRequest(req.userId, {
         products: ['transactions'],
@@ -166,25 +305,42 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       const d = await plaid.call('linkTokenCreate', linkTokenRequest(req.userId, {
         access_token: item.accessToken, // update mode: no products
         ...(item.newAccountsAvailable ? { update: { account_selection_enabled: true } } : {}),
-      }));
+      }), { ctx: { itemId } });
       await store.putPending(req.userId, d.link_token, { mode: 'update', itemId });
       res.json({ ...linkResponse(d), mode: 'update', item_id: itemId });
     } catch (e) { fail(res, e, 'update link token create failed', 'Could not start reconnecting this bank.', 'LINK_TOKEN_FAILED'); }
   });
 
-  async function exchangeOnce(userId, publicToken, metadata = {}) {
+  async function exchangeOnce(req, userId, publicToken, metadata = {}) {
     const hash = sha256Hex(publicToken);
     const prior = await store.getExchanged(hash);
     if (prior) {
       if (prior.userId !== userId) throw Object.assign(new Error('public token belongs to another user'), { status: 403 });
       return { connected: true, item_id: prior.itemId, institution: metadata?.institution?.name || null, duplicate_exchange: true };
     }
-    const ex = await plaid.call('itemPublicTokenExchange', { public_token: publicToken }, { idempotent: false });
+    const gate = await linkGate(req, userId); // before exchange: no new Plaid Item is created over the limit
+    const ex = await plaid.call('itemPublicTokenExchange', { public_token: publicToken }, { idempotent: false, ctx: { userId } });
     const institution = metadata?.institution || {};
+    let fps = [];
+    if (gate.free) {
+      // Fingerprint the real accounts BEFORE storing this as the user's free bank.
+      const removeAtPlaid = () => plaid.call('itemRemove', { access_token: ex.access_token }, { ctx: { itemId: ex.item_id } })
+        .catch(e => log.error('item remove after free-tier rejection failed', { item_id: ex.item_id, ...plaidErrorInfo(e) }));
+      let acc;
+      try { acc = await plaid.call('accountsGet', { access_token: ex.access_token }, { ctx: { itemId: ex.item_id } }); } catch (e) { await removeAtPlaid(); throw e; }
+      const instId = acc?.item?.institution_id || institution.institution_id || institution.id || '';
+      fps = accountFingerprints(config.freeTier.secret, instId, acc?.accounts || []);
+      if (await store.findFreeTierConflict(userId, fps)) {
+        await removeAtPlaid();
+        log.warn('free-tier link rejected: account already used', { user_id: userId });
+        throw gateError(402, gate.limitBody('account_already_used_free'));
+      }
+    }
     await store.putItem({
       userId, itemId: ex.item_id, accessToken: ex.access_token,
       institutionId: institution.institution_id || institution.id || '', institutionName: institution.name || '',
     });
+    if (gate.free) await store.claimFreeTier(userId, ex.item_id, [...fps, gate.device]);
     await store.markExchanged(hash, userId, ex.item_id);
     log.info('item linked', { user_id: userId, item_id: ex.item_id, request_id: ex.request_id });
     return { connected: true, item_id: ex.item_id, institution: institution.name || null };
@@ -194,7 +350,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   async function completeUpdate(userId, itemId) {
     const item = (await store.getItems(userId)).find(i => i.itemId === itemId);
     if (!item) return { ok: false, status: 404, body: { error: 'Connection not found.', code: 'ITEM_NOT_FOUND' } };
-    const d = await plaid.call('itemGet', { access_token: item.accessToken });
+    const d = await plaid.call('itemGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
     const err = d?.item?.error;
     if (err && err.error_code) {
       await store.setItemStatus(itemId, statusForItemError(err.error_code, err.error_code_reason), err.error_code);
@@ -236,13 +392,19 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
         else if (s?.on_success?.public_token) results.push({ publicToken: s.on_success.public_token, metadata: s.on_success.metadata || {} });
       }
       const connectedItems = [];
+      let limitHit = null;
       for (const r of results) {
         if (!r.publicToken) continue;
-        connectedItems.push(await exchangeOnce(userId, r.publicToken, r.metadata)); // throws -> pending kept, safe to retry
+        try {
+          connectedItems.push(await exchangeOnce(req, userId, r.publicToken, r.metadata)); // throws -> pending kept, safe to retry
+        } catch (e) {
+          if (e.status === 402 && connectedItems.length) { limitHit = e.body; continue; }
+          throw e;
+        }
       }
       if (connectedItems.length) {
         await store.clearPending(userId);
-        return res.json({ connected: true, pending: false, status: 'success', count: connectedItems.length, institution: connectedItems[0]?.institution || null, items: connectedItems });
+        return res.json({ connected: true, pending: false, status: 'success', count: connectedItems.length, institution: connectedItems[0]?.institution || null, items: connectedItems, ...(limitHit ? { skipped: limitHit } : {}) });
       }
 
       const last = sessions[sessions.length - 1];
@@ -260,6 +422,10 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       return res.json({ connected: false, pending: true, status: 'pending' });
     } catch (e) {
       if (e.status === 403) return res.status(403).json({ error: 'Forbidden.', code: 'USER_MISMATCH' });
+      if (isGateError(e)) {
+        await store.clearPending(userId).catch(() => {});
+        return res.status(e.status).json({ connected: false, pending: false, status: e.body.error, ...e.body });
+      }
       const pd = e?.response?.data || {};
       const pmsg = String(pd.error_message || pd.display_message || '');
       if (['INVALID_LINK_TOKEN', 'INVALID_PUBLIC_TOKEN'].includes(pd.error_code) || /expired|invalid.*token/i.test(pmsg)) {
@@ -275,10 +441,11 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   api.post('/plaid/exchange-public-token', enforceUserMatch, async (req, res) => {
     if (!req.body?.public_token) return res.status(400).json({ error: 'Missing public token.', code: 'MISSING_PUBLIC_TOKEN' });
     try {
-      const out = await exchangeOnce(req.userId, String(req.body.public_token), req.body.metadata || {});
+      const out = await exchangeOnce(req, req.userId, String(req.body.public_token), req.body.metadata || {});
       await store.clearPending(req.userId);
       res.json(out);
     } catch (e) {
+      if (isGateError(e)) return res.status(e.status).json(e.body);
       if (e.status === 403) return res.status(403).json({ error: 'Forbidden.', code: 'USER_MISMATCH' });
       fail(res, e, 'public token exchange failed', 'Could not finish connecting this bank.', 'TOKEN_EXCHANGE_FAILED');
     }
@@ -303,7 +470,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       for (const item of items) {
         if (BLOCKED_STATUSES.has(item.status)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: item.errorCode || item.status, message: 'Reconnect this bank to refresh its balance.', needs_update: true }); continue; }
         try {
-          const d = await plaid.call('accountsGet', { access_token: item.accessToken });
+          const d = await plaid.call('accountsGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
           for (const a of d.accounts) accounts.push(decorateAccount(a, item));
         } catch (e) {
           const code = itemErrorCode(e);
@@ -323,7 +490,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   /** Calls /item/remove; "already gone" at Plaid counts as removed. Throws on other errors. */
   async function removeAtPlaid(item) {
     try {
-      await plaid.call('itemRemove', { access_token: item.accessToken });
+      await plaid.call('itemRemove', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
     } catch (e) {
       const code = e?.response?.data?.error_code;
       if (!['ITEM_NOT_FOUND', 'INVALID_ACCESS_TOKEN'].includes(code)) throw e;
@@ -397,7 +564,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       const items = await store.getItems(req.userId), status = [];
       for (const item of items) {
         try {
-          const d = await plaid.call('itemGet', { access_token: item.accessToken });
+          const d = await plaid.call('itemGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
           status.push({ ...itemSummary(item), billed_products: d?.item?.billed_products || [], available_products: d?.item?.available_products || [], has_transactions_cursor: Boolean(item.transactionsCursor) });
         } catch (e) {
           log.error('item get failed', { item_id: item.itemId, ...plaidErrorInfo(e) });

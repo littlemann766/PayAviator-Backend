@@ -3,10 +3,13 @@ import { loadConfig, ConfigError } from './src/config.js';
 import { log } from './src/log.js';
 import { createTokenVerifier } from './src/auth.js';
 import { createPlaidClient } from './src/plaid.js';
+import { instrumentPlaid } from './src/plaidLog.js';
 import { createWebhookVerifier } from './src/webhookVerify.js';
 import { PgStore, MemoryStore } from './src/store.js';
 import { createSyncer } from './src/sync.js';
 import { createApp } from './src/app.js';
+import { createIntegrityClient } from './src/integrity.js';
+import { createGooglePlayClient, createPubSubVerifier } from './src/billing.js';
 
 let config, warnings;
 try {
@@ -20,7 +23,7 @@ try {
 }
 for (const w of warnings) log.warn(w);
 
-const plaid = createPlaidClient(config.plaid, { log });
+const plaid = instrumentPlaid(createPlaidClient(config.plaid, { log }), log); // one plaid_api JSON line per call
 
 let store;
 let dbReady = false;
@@ -54,8 +57,23 @@ const webhookVerifier = createWebhookVerifier({
 });
 const syncItem = createSyncer({ store, plaid, log });
 
+if (!config.freeTier.configured) log.error('FREE_TIER_FINGERPRINT_SECRET missing/invalid: free-tier bank links return 503 free_tier_not_configured (subscribers unaffected)');
+// Purge free-tier hashes whose 30-day (FREE_TIER_COOLDOWN_DAYS) cooldown has ended: on startup and daily.
+const purgeFreeTier = () => store.purgeFreeTier(config.freeTier.cooldownDays)
+  .then(n => { if (n) log.info('purged expired free-tier hashes', { count: n }); })
+  .catch(e => log.error('free-tier purge failed', { error_message: e.message }));
+purgeFreeTier();
+setInterval(purgeFreeTier, 24 * 60 * 60 * 1000).unref();
+
+const integrity = config.integrity.configured ? createIntegrityClient(config.integrity) : null;
+const googlePlay = config.billing.configured ? createGooglePlayClient(config.billing) : null;
+const pubsubVerifier = config.billing.configured && config.billing.rtdnAudience
+  ? createPubSubVerifier({ audience: config.billing.rtdnAudience, serviceAccountEmail: config.billing.rtdnServiceAccountEmail })
+  : null;
+if (!googlePlay) log.warn('billing_not_configured: /api/billing/google-play/* return 503; free one-bank limit still enforced');
+
 const app = createApp({
-  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log,
+  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity,
   health: () => ({ storage: storageKind, databaseReady: dbReady }),
 });
 

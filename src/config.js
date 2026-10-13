@@ -140,6 +140,44 @@ export function loadConfig(env = process.env) {
 
   const corsOrigins = list(env.CORS_ORIGINS);
 
+  // --- Google Play billing (optional: missing/invalid => billing endpoints 503, free limit still enforced) ---
+  let playServiceAccount = null;
+  if (env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON) {
+    try {
+      const raw = String(env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON).trim();
+      playServiceAccount = JSON.parse(raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8'));
+      if (!playServiceAccount.client_email || !playServiceAccount.private_key) throw new Error('missing client_email/private_key');
+    } catch (e) {
+      playServiceAccount = null;
+      warnings.push(`GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is invalid (${e.message}); Google Play billing disabled`);
+    }
+  }
+  const androidPackageName = String(env.ANDROID_PACKAGE_NAME || '').trim();
+  const playProductIds = list(env.GOOGLE_PLAY_PRODUCT_IDS);
+  let freeTierSecret = String(env.FREE_TIER_FINGERPRINT_SECRET || '');
+  if (freeTierSecret && freeTierSecret.length < 32) { warnings.push('FREE_TIER_FINGERPRINT_SECRET must be at least 32 characters; ignoring it'); freeTierSecret = ''; }
+  if (!freeTierSecret) warnings.push('FREE_TIER_FINGERPRINT_SECRET not set: free-tier bank links fail closed with 503 free_tier_not_configured');
+  const cooldownDays = Number(env.FREE_TIER_COOLDOWN_DAYS || 30);
+  const freeTier = { secret: freeTierSecret || null, configured: Boolean(freeTierSecret), cooldownDays: Number.isFinite(cooldownDays) && cooldownDays >= 0 ? cooldownDays : 30 };
+  const billing = {
+    configured: Boolean(playServiceAccount && androidPackageName),
+    serviceAccount: playServiceAccount,
+    packageName: androidPackageName || null,
+    productIds: playProductIds,
+    rtdnAudience: env.GOOGLE_PLAY_RTDN_AUDIENCE || null,
+    rtdnServiceAccountEmail: env.GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT || null,
+    // Owner/comp accounts (Firebase UIDs): unlimited banks, no subscription, skip free-tier checks.
+    compUids: new Set(list(env.COMP_FIREBASE_UIDS)),
+  };
+  const integrity = {
+    enforce: String(env.PLAY_INTEGRITY_ENFORCE || '').trim().toLowerCase() === 'true',
+    configured: Boolean(playServiceAccount && androidPackageName),
+    serviceAccount: playServiceAccount,
+    packageName: androidPackageName || null,
+  };
+  if (integrity.enforce && !integrity.configured) warnings.push('PLAY_INTEGRITY_ENFORCE=true but GOOGLE_PLAY_SERVICE_ACCOUNT_JSON/ANDROID_PACKAGE_NAME missing: free-tier links return 503 integrity_not_configured');
+  if (isProduction && !billing.configured) warnings.push('Google Play billing not configured (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON + ANDROID_PACKAGE_NAME); second bank links will be refused');
+
   if (errors.length) throw new ConfigError(errors);
 
   return {
@@ -167,6 +205,9 @@ export function loadConfig(env = process.env) {
       tokenEncryptionKey,
       auth,
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
+      billing,
+      freeTier,
+      integrity,
       rateLimit: {
         windowMs: 15 * 60 * 1000,
         max: Number(env.RATE_LIMIT_MAX || 300),

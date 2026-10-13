@@ -9,7 +9,7 @@ import { MemoryStore } from '../src/store.js';
 import { statusForItemError } from '../src/plaid.js';
 import { silentLog } from '../src/log.js';
 
-const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({}).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
+const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({ email_verified: true }).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
 
 async function seed(store) {
   await store.putItem({ userId: 'user-1', itemId: 'item-r', accessToken: 'access-sandbox-r', institutionName: 'PNC' });

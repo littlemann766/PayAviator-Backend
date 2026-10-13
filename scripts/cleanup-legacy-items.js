@@ -13,6 +13,8 @@ import 'dotenv/config';
 import pg from 'pg';
 import { loadConfig } from '../src/config.js';
 import { createPlaidClient } from '../src/plaid.js';
+import { instrumentPlaid } from '../src/plaidLog.js';
+import { log as plaidAuditLog } from '../src/log.js';
 import { stripSslParams } from '../src/store.js';
 import { cleanupLegacyItems } from '../src/legacy.js';
 
@@ -26,7 +28,7 @@ if (!config.tokenEncryptionKey) { console.error('TOKEN_ENCRYPTION_KEY is require
 if (apply && !config.plaid.configured) { console.error('PLAID_CLIENT_ID / PLAID_SECRET are required for --apply.'); process.exit(2); }
 
 const pool = new pg.Pool({ connectionString: stripSslParams(config.db.url), ssl: config.db.ssl, max: 2 });
-const plaid = createPlaidClient(config.plaid);
+const plaid = instrumentPlaid(createPlaidClient(config.plaid), plaidAuditLog);
 try {
   console.log(`PayAviator legacy item cleanup (plaid_env=${config.plaid.env}, mode=${apply ? 'APPLY' : 'dry-run'})`);
   const report = await cleanupLegacyItems({ pool, plaid, key: config.tokenEncryptionKey, apply });

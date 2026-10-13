@@ -10,7 +10,8 @@ export function testConfig(extra = {}) {
   return loadConfig({
     PLAID_ENV: 'sandbox', PLAID_CLIENT_ID: 'cid', PLAID_SECRET: 'sec',
     APP_JWT_SECRET: JWT_SECRET, PLAID_WEBHOOK_URL: 'https://example.com/api/plaid/webhook',
-    PLAID_REDIRECT_URI: 'https://example.com/plaid/oauth-redirect', ...extra,
+    PLAID_REDIRECT_URI: 'https://example.com/plaid/oauth-redirect',
+    FREE_TIER_FINGERPRINT_SECRET: 'test-free-tier-secret-0123456789abcdef', ...extra,
   }).config;
 }
 
@@ -26,9 +27,9 @@ export function fakePlaid(handlers = {}) {
   };
 }
 
-export function buildApp({ config = testConfig(), store = new MemoryStore(), plaid = fakePlaid(), webhookVerifier, syncItem } = {}) {
+export function buildApp({ config = testConfig(), store = new MemoryStore(), plaid = fakePlaid(), webhookVerifier, syncItem, googlePlay = null, pubsubVerifier = null, integrity = null } = {}) {
   const app = createApp({
-    config, store, plaid, log: silentLog,
+    config, store, plaid, log: silentLog, googlePlay, pubsubVerifier, integrity,
     tokenVerifier: createTokenVerifier(config.auth),
     webhookVerifier: webhookVerifier || (async () => { throw new Error('no verifier'); }),
     syncItem: syncItem || (async item => ({ item_id: item.itemId })),

@@ -136,3 +136,31 @@ test('PgStore.revokeItem purges only that item and blocks late syncs', { skip: !
   assert.equal((await store.getItemById('r')).transactionsCursor, null);
   await store.close(); await raw.end();
 });
+
+test('PgStore: billing entitlements and free-tier claims (conflict, release, cooldown purge)', { skip: !url && 'TEST_DATABASE_URL not set' }, async () => {
+  const raw = new pg.Pool({ connectionString: url });
+  await raw.query('DROP TABLE IF EXISTS billing_entitlements, free_tier_claims');
+  const store = new PgStore({ url, ssl: false }, crypto.randomBytes(32));
+  await store.init();
+  const exp = new Date(Date.now() + 86400e3).toISOString();
+  await store.putEntitlement({ tokenHash: 'th', userId: 'u1', productId: 'p', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: exp });
+  await store.putEntitlement({ tokenHash: 'th', userId: 'u2', productId: 'p', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: exp }); // cannot steal
+  assert.equal((await store.getEntitlementByTokenHash('th')).userId, 'u1');
+  assert.equal((await store.getEntitlements('u1'))[0].expiresAt, exp);
+
+  await store.putItem({ userId: 'u1', itemId: 'fi1', accessToken: 'a' });
+  await store.claimFreeTier('u1', 'fi1', [{ kind: 'acct', hash: 'h1' }, { kind: 'device', hash: 'd1' }]);
+  assert.equal(await store.findFreeTierConflict('u1', [{ kind: 'acct', hash: 'h1' }]), null, 'own claim is no conflict');
+  assert.deepEqual(await store.findFreeTierConflict('u2', [{ kind: 'pacct', hash: 'zz' }, { kind: 'device', hash: 'd1' }]), { kind: 'device' });
+  assert.equal(await store.findFreeTierConflict('u2', [{ kind: 'device', hash: 'h1' }]), null, 'kind is part of the key');
+  await store.deleteItem('u1', 'fi1');
+  assert.equal((await raw.query('SELECT count(*)::int n FROM free_tier_claims WHERE released_at IS NOT NULL')).rows[0].n, 2);
+  assert.ok(await store.findFreeTierConflict('u2', [{ kind: 'acct', hash: 'h1' }]), 'still blocks during cooldown');
+  assert.equal(await store.purgeFreeTier(30), 0);
+  await raw.query(`UPDATE free_tier_claims SET released_at = NOW() - INTERVAL '31 days'`);
+  assert.equal(await store.purgeFreeTier(30), 2);
+  await store.claimFreeTier('u3', 'fi3', [{ kind: 'acct', hash: 'h3' }]);
+  await store.deleteUserData('u3');
+  assert.equal((await raw.query(`SELECT count(*)::int n FROM free_tier_claims WHERE user_id='u3' AND released_at IS NOT NULL`)).rows[0].n, 1);
+  await store.close(); await raw.end();
+});

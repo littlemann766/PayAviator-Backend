@@ -8,13 +8,13 @@ import { MemoryStore } from '../src/store.js';
 import { withRetry } from '../src/retry.js';
 import { silentLog } from '../src/log.js';
 
-const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({}).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
+const bearer = async (sub = 'user-1') => `Bearer ${await new SignJWT({ email_verified: true }).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET))}`;
 const plaidErr = (status, error_code, error_type = 'API_ERROR') => Object.assign(new Error(error_code), { response: { status, data: { error_code, error_type, request_id: 'req-1', error_message: 'internal detail' } } });
 
 test('link token uses webhook, redirect_uri, days_requested and user from token', async () => {
   const plaid = fakePlaid({ linkTokenCreate: async () => ({ link_token: 'link-1', hosted_link_url: 'https://hosted' }) });
   const { app } = buildApp({ plaid });
-  const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).send({});
+  const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', await bearer()).set('X-Device-Id', '0123456789abcdef').send({});
   assert.equal(r.status, 200);
   const req = plaid.calls[0].req;
   assert.equal(req.user.client_user_id, 'user-1');
@@ -44,6 +44,7 @@ test('hosted-status exchanges each public token once across all sessions', async
     itemPublicTokenExchange: async ({ public_token }) => { n++; if (public_token === 'public-b' && n === 2) throw plaidErr(500, 'INTERNAL_SERVER_ERROR'); return { item_id: `item-${public_token}`, access_token: `access-${public_token}` }; },
   });
   const { app, store } = buildApp({ plaid });
+  await store.putEntitlement({ tokenHash: 'h', userId: 'user-1', productId: 'premium', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: new Date(Date.now() + 86400e3).toISOString() }); // two banks needs a plan
   await store.putPending('user-1', 'link-1');
   const first = await request(app).get('/api/plaid/hosted-status').set('Authorization', await bearer());
   assert.equal(first.status, 502);

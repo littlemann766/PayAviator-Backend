@@ -1,4 +1,5 @@
 import { ITEM_STATUS, statusForItemError } from './plaid.js';
+import { plaidWebhookFields, withPlaidContext } from './plaidLog.js';
 
 /**
  * Routes a verified Plaid webhook. Status updates are awaited (so Plaid retries
@@ -9,8 +10,11 @@ export async function handleWebhook(payload, { store, syncItem, log }) {
   const { webhook_type: type, webhook_code: code, item_id: itemId } = payload || {};
   const ctx = { webhook_type: type, webhook_code: code, item_id: itemId, environment: payload?.environment };
   const item = itemId ? await store.getItemById(itemId) : null;
-  if (itemId && !item) { log.warn('webhook for unknown item', ctx); return {}; }
-  log.info('webhook received', ctx);
+  if (itemId && !item) { log.warn('plaid_webhook', plaidWebhookFields(payload, { outcome: 'unknown_item' })); return {}; }
+  log.info('plaid_webhook', plaidWebhookFields(payload, { userId: item?.userId }));
+  if (type === 'TRANSACTIONS' && code === 'SYNC_UPDATES_AVAILABLE') {
+    return { background: withPlaidContext({ userId: item?.userId, itemId }, () => syncItem(item)) };
+  }
 
   if (type === 'TRANSACTIONS') {
     if (code === 'SYNC_UPDATES_AVAILABLE') return { background: syncItem(item) };
