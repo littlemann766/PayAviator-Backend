@@ -22,7 +22,8 @@
     "helmet": "^8.3.0",
     "jose": "^6.2.12",
     "pg": "^8.23.1",
-    "plaid": "^48.0.0"
+    "plaid": "^48.0.0",
+    "stripe": "^19.3.0"
   },
   "devDependencies": {
     "supertest": "^7.3.1"

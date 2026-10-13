@@ -31,7 +31,8 @@ used a free slot on a **different** account. If so, we cancel the new connection
 - While the bank stays linked: kept.
 - When the user removes that bank, or deletes their account: the fingerprints are kept for
   **30 days** (the "cooldown", so removing and re-adding on another email doesn't work), then
-  permanently deleted. The server checks for expired fingerprints on startup and once a day.
+  permanently deleted. The server deletes expired fingerprints on startup and every hour, and
+  lookups ignore any fingerprint past 30 days even before that cleanup runs.
 - Bank data itself (access tokens, transactions) is still deleted right away as before; only
   these fingerprints wait out the 30 days.
 
@@ -47,3 +48,12 @@ When the flag is off the header is ignored.
 one-way, encrypted fingerprint of the bank account (based on the bank and the account's last
 four digits) and of your device's Android ID. We cannot read the original details from these
 fingerprints. They're deleted 30 days after you remove the bank or delete your account."
+
+## Exact retention table (server)
+| Data | Kept while | Deleted |
+|---|---|---|
+| Bank/device fingerprints (HMAC) for a linked free bank | bank linked (incl. Plaid-revoked items kept for "Reconnect") | 30 days after the bank is removed or the account data is deleted (`FREE_TIER_COOLDOWN_DAYS`) |
+| Stripe customer id <-> sign-in id | while the account exists | not yet auto-deleted (needed for the billing portal); TODO on account deletion |
+| Stripe webhook event ids (no payment data) | 30 days | hourly purge |
+| Subscription entitlement (store, plan id, state, expiry; Play token only as sha256) | while the account exists | — |
+No card numbers or payment details are ever received; Stripe Checkout handles them.

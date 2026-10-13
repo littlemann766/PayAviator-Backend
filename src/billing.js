@@ -28,6 +28,8 @@ export async function billingSummary(store, userId, now = Date.now(), { compUids
     .sort((a, b) => new Date(b.expiresAt) - new Date(a.expiresAt))[0] || null;
   return {
     plan: comp ? 'comp' : active ? 'premium' : 'free',
+    // What unlocked premium: 'comp' | 'play' | 'stripe' | null (free). Whichever store is active wins; no migration.
+    source: comp ? 'comp' : active ? (active.platform === 'stripe' ? 'stripe' : 'play') : null,
     linkedBanks: linked,
     limit: comp || active ? null : FREE_BANK_LIMIT,
     expiresAt: active ? new Date(active.expiresAt).toISOString() : null,

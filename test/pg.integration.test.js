@@ -158,9 +158,31 @@ test('PgStore: billing entitlements and free-tier claims (conflict, release, coo
   assert.ok(await store.findFreeTierConflict('u2', [{ kind: 'acct', hash: 'h1' }]), 'still blocks during cooldown');
   assert.equal(await store.purgeFreeTier(30), 0);
   await raw.query(`UPDATE free_tier_claims SET released_at = NOW() - INTERVAL '31 days'`);
+  assert.equal(await store.findFreeTierConflict('u2', [{ kind: 'acct', hash: 'h1' }], 30), null, 'expired hash ignored before purge');
   assert.equal(await store.purgeFreeTier(30), 2);
   await store.claimFreeTier('u3', 'fi3', [{ kind: 'acct', hash: 'h3' }]);
   await store.deleteUserData('u3');
   assert.equal((await raw.query(`SELECT count(*)::int n FROM free_tier_claims WHERE user_id='u3' AND released_at IS NOT NULL`)).rows[0].n, 1);
+  await store.close(); await raw.end();
+});
+
+test('PgStore: stripe customers, event idempotency and event purge', { skip: !url && 'TEST_DATABASE_URL not set' }, async () => {
+  const raw = new pg.Pool({ connectionString: url });
+  await raw.query('DROP TABLE IF EXISTS stripe_customers, stripe_events');
+  const store = new PgStore({ url, ssl: false }, crypto.randomBytes(32));
+  await store.init();
+  await store.putStripeCustomer('u1', 'cus_1');
+  await store.putStripeCustomer('u1', 'cus_1');
+  assert.equal(await store.getStripeCustomer('u1'), 'cus_1');
+  assert.equal(await store.getUserByStripeCustomer('cus_1'), 'u1');
+  assert.equal(await store.hasStripeEvent('evt_1'), false);
+  await store.markStripeEvent('evt_1', 'checkout.session.completed');
+  await store.markStripeEvent('evt_1', 'checkout.session.completed');
+  assert.equal(await store.hasStripeEvent('evt_1'), true);
+  await store.putEntitlement({ tokenHash: 'stripe_sub:sub_1', userId: 'u1', productId: 'price_m', platform: 'stripe', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: new Date(Date.now() + 86400e3).toISOString() });
+  assert.equal((await store.getEntitlementByTokenHash('stripe_sub:sub_1')).platform, 'stripe');
+  assert.equal(await store.purgeStripeEvents(30), 0);
+  await raw.query(`UPDATE stripe_events SET processed_at = NOW() - INTERVAL '31 days'`);
+  assert.equal(await store.purgeStripeEvents(30), 1);
   await store.close(); await raw.end();
 });

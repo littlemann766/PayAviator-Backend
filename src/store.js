@@ -88,15 +88,46 @@ export class PgStore {
     await q('CREATE INDEX IF NOT EXISTS free_tier_claims_item_idx ON free_tier_claims(item_id)');
     await q('CREATE INDEX IF NOT EXISTS free_tier_claims_user_idx ON free_tier_claims(user_id)');
 
+    // Stripe web billing: uid <-> Stripe customer id (for the portal), and processed webhook event ids (idempotency).
+    await q(`CREATE TABLE IF NOT EXISTS stripe_customers (
+      user_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ DEFAULT NOW())`);
+    await q(`CREATE TABLE IF NOT EXISTS stripe_events (
+      event_id TEXT PRIMARY KEY, type TEXT NOT NULL, processed_at TIMESTAMPTZ DEFAULT NOW())`);
+
     await this.encryptLegacyTokens();
   }
 
+  async putStripeCustomer(userId, customerId) {
+    await this.pool.query(`INSERT INTO stripe_customers(user_id,customer_id) VALUES($1,$2)
+      ON CONFLICT(user_id) DO UPDATE SET customer_id=EXCLUDED.customer_id`, [userId, customerId]);
+  }
+  async getStripeCustomer(userId) {
+    const r = await this.pool.query('SELECT customer_id FROM stripe_customers WHERE user_id=$1', [userId]);
+    return r.rows[0]?.customer_id || null;
+  }
+  async getUserByStripeCustomer(customerId) {
+    const r = await this.pool.query('SELECT user_id FROM stripe_customers WHERE customer_id=$1', [customerId]);
+    return r.rows[0]?.user_id || null;
+  }
+  async hasStripeEvent(id) {
+    return (await this.pool.query('SELECT 1 FROM stripe_events WHERE event_id=$1', [id])).rowCount > 0;
+  }
+  async markStripeEvent(id, type) {
+    await this.pool.query('INSERT INTO stripe_events(event_id,type) VALUES($1,$2) ON CONFLICT DO NOTHING', [id, type]);
+  }
+  /** Stripe retries for at most 3 days; event ids older than 30 days are no longer needed. */
+  async purgeStripeEvents(days = 30) {
+    return (await this.pool.query('DELETE FROM stripe_events WHERE processed_at < NOW() - make_interval(days => $1::int)', [Math.floor(days)])).rowCount;
+  }
+
   /** First claim on any of these hashes held by a different user (active or still in cooldown), else null. */
-  async findFreeTierConflict(userId, fps) {
+  /** Released claims older than cooldownDays are ignored (purge-on-access), even if the purge job has not run yet. */
+  async findFreeTierConflict(userId, fps, cooldownDays = 30) {
     if (!fps.length) return null;
     const r = await this.pool.query(
-      `SELECT kind FROM free_tier_claims WHERE user_id<>$1 AND (kind, hash) IN (SELECT * FROM unnest($2::text[], $3::text[])) LIMIT 1`,
-      [userId, fps.map(f => f.kind), fps.map(f => f.hash)]);
+      `SELECT kind FROM free_tier_claims WHERE user_id<>$1 AND (kind, hash) IN (SELECT * FROM unnest($2::text[], $3::text[]))
+         AND (released_at IS NULL OR released_at >= NOW() - make_interval(days => $4::int)) LIMIT 1`,
+      [userId, fps.map(f => f.kind), fps.map(f => f.hash), Math.floor(cooldownDays)]);
     return r.rows[0] ? { kind: r.rows[0].kind } : null;
   }
 
@@ -335,11 +366,14 @@ export class MemoryStore {
     this.pending = new Map();
     this.exchanged = new Map();
     this.entitlements = new Map(); // tokenHash -> entitlement
+    this.stripeCustomers = new Map(); // userId -> customerId
+    this.stripeEvents = new Map(); // eventId -> {type, at}
     this.claims = new Map(); // `${kind}|${hash}|${userId}` -> {kind,hash,userId,itemId,releasedAt}
   }
-  async findFreeTierConflict(userId, fps) {
+  async findFreeTierConflict(userId, fps, cooldownDays = 30, now = Date.now()) {
     const want = new Set(fps.map(f => `${f.kind}|${f.hash}`));
-    for (const c of this.claims.values()) if (c.userId !== userId && want.has(`${c.kind}|${c.hash}`)) return { kind: c.kind };
+    const cutoff = now - cooldownDays * 86400e3;
+    for (const c of this.claims.values()) if (c.userId !== userId && want.has(`${c.kind}|${c.hash}`) && (!c.releasedAt || c.releasedAt >= cutoff)) return { kind: c.kind };
     return null;
   }
   async claimFreeTier(userId, itemId, fps) { for (const f of fps) this.claims.set(`${f.kind}|${f.hash}|${userId}`, { ...f, userId, itemId, releasedAt: null }); }
@@ -355,6 +389,12 @@ export class MemoryStore {
     if (prev && prev.userId !== e.userId) return;
     this.entitlements.set(e.tokenHash, { tokenHash: e.tokenHash, userId: e.userId, productId: e.productId, platform: e.platform || 'google_play', state: e.state, expiresAt: e.expiresAt || null });
   }
+  async putStripeCustomer(userId, customerId) { this.stripeCustomers.set(userId, customerId); }
+  async getStripeCustomer(userId) { return this.stripeCustomers.get(userId) || null; }
+  async getUserByStripeCustomer(cid) { for (const [u, c] of this.stripeCustomers) if (c === cid) return u; return null; }
+  async hasStripeEvent(id) { return this.stripeEvents.has(id); }
+  async markStripeEvent(id, type) { if (!this.stripeEvents.has(id)) this.stripeEvents.set(id, { type, at: Date.now() }); }
+  async purgeStripeEvents(days = 30, now = Date.now()) { let n = 0; for (const [k, v] of this.stripeEvents) if (v.at < now - days * 86400e3) { this.stripeEvents.delete(k); n++; } return n; }
   async getEntitlementByTokenHash(h) { const e = this.entitlements.get(h); return e ? { ...e } : null; }
   async getEntitlements(userId) { return [...this.entitlements.values()].filter(e => e.userId === userId).map(e => ({ ...e })); }
   async init() {}

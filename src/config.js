@@ -169,6 +169,17 @@ export function loadConfig(env = process.env) {
     // Owner/comp accounts (Firebase UIDs): unlimited banks, no subscription, skip free-tier checks.
     compUids: new Set(list(env.COMP_FIREBASE_UIDS)),
   };
+  // --- Stripe web subscriptions (optional: all four required, else /api/billing/stripe/* return 503) ---
+  const stripeVars = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICE_MONTHLY', 'STRIPE_PRICE_YEARLY'];
+  const stripeSet = stripeVars.filter(k => String(env[k] || '').trim());
+  const stripe = {
+    configured: stripeSet.length === stripeVars.length,
+    secretKey: String(env.STRIPE_SECRET_KEY || '').trim() || null,
+    webhookSecret: String(env.STRIPE_WEBHOOK_SECRET || '').trim() || null,
+    priceMonthly: String(env.STRIPE_PRICE_MONTHLY || '').trim() || null,
+    priceYearly: String(env.STRIPE_PRICE_YEARLY || '').trim() || null,
+  };
+  if (stripeSet.length && !stripe.configured) warnings.push(`Stripe partially configured; missing ${stripeVars.filter(k => !stripeSet.includes(k)).join(', ')}: /api/billing/stripe/* return 503`);
   const integrity = {
     enforce: String(env.PLAY_INTEGRITY_ENFORCE || '').trim().toLowerCase() === 'true',
     configured: Boolean(playServiceAccount && androidPackageName),
@@ -207,6 +218,7 @@ export function loadConfig(env = process.env) {
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
       billing,
       freeTier,
+      stripe,
       integrity,
       rateLimit: {
         windowMs: 15 * 60 * 1000,

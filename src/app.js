@@ -10,6 +10,7 @@ import { handleWebhook } from './webhooks.js';
 import { plaidContextMiddleware } from './plaidLog.js';
 import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from './freeTier.js';
 import { checkVerdict } from './integrity.js';
+import { stripeRoutes, stripeWebhookRoute } from './stripeBilling.js';
 import { FREE_BANK_LIMIT, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
 
 /** Items in these states cannot be used until the user completes update mode. */
@@ -64,7 +65,7 @@ function decorateAccount(a, item) {
   };
 }
 
-export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null }) {
+export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null, stripe = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -158,6 +159,9 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     }
   });
 
+  // ---------- Stripe webhook (public, signature-verified, raw body) ----------
+  stripeWebhookRoute(app, { config, store, stripe, log, limiter: publicLimiter });
+
   // ---------- Billing API (signed-in) ----------
   const billing = express.Router();
   billing.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max, standardHeaders: 'draft-8', legacyHeaders: false }));
@@ -167,7 +171,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   billing.get('/status', async (req, res) => {
     try {
       const s = await billingSummary(store, req.userId, Date.now(), summaryOpts);
-      res.json({ ...s, billingConfigured: billingReady() });
+      res.json({ ...s, billingConfigured: billingReady(), stripeConfigured: Boolean(config.stripe?.configured && stripe) });
     } catch (e) {
       log.error('billing status failed', { error_message: e.message });
       res.status(500).json({ error: 'Could not load plan.', code: 'BILLING_STATUS_FAILED' });
@@ -201,6 +205,8 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       res.status(502).json({ error: 'verify_failed', code: 'VERIFY_FAILED' });
     }
   });
+
+  stripeRoutes(billing, { config, store, stripe, log, summary: uid => billingSummary(store, uid, Date.now(), summaryOpts) });
 
   app.use('/api/billing', billing);
 
@@ -275,7 +281,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     const deviceId = dev.id;
     if (config.integrity?.enforce) await checkIntegrity(req, deviceId, userId);
     const device = deviceFingerprint(config.freeTier.secret, deviceId);
-    if (await store.findFreeTierConflict(userId, [device])) throw gateError(402, limitBody('device_already_used_free'));
+    if (await store.findFreeTierConflict(userId, [device], config.freeTier.cooldownDays)) throw gateError(402, limitBody('device_already_used_free'));
     return { free: true, device, limitBody };
   }
 
@@ -330,7 +336,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       try { acc = await plaid.call('accountsGet', { access_token: ex.access_token }, { ctx: { itemId: ex.item_id } }); } catch (e) { await removeAtPlaid(); throw e; }
       const instId = acc?.item?.institution_id || institution.institution_id || institution.id || '';
       fps = accountFingerprints(config.freeTier.secret, instId, acc?.accounts || []);
-      if (await store.findFreeTierConflict(userId, fps)) {
+      if (await store.findFreeTierConflict(userId, fps, config.freeTier.cooldownDays)) {
         await removeAtPlaid();
         log.warn('free-tier link rejected: account already used', { user_id: userId });
         throw gateError(402, gate.limitBody('account_already_used_free'));

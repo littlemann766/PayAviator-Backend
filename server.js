@@ -9,6 +9,7 @@ import { PgStore, MemoryStore } from './src/store.js';
 import { createSyncer } from './src/sync.js';
 import { createApp } from './src/app.js';
 import { createIntegrityClient } from './src/integrity.js';
+import { createStripeClient } from './src/stripeBilling.js';
 import { createGooglePlayClient, createPubSubVerifier } from './src/billing.js';
 
 let config, warnings;
@@ -58,12 +59,13 @@ const webhookVerifier = createWebhookVerifier({
 const syncItem = createSyncer({ store, plaid, log });
 
 if (!config.freeTier.configured) log.error('FREE_TIER_FINGERPRINT_SECRET missing/invalid: free-tier bank links return 503 free_tier_not_configured (subscribers unaffected)');
-// Purge free-tier hashes whose 30-day (FREE_TIER_COOLDOWN_DAYS) cooldown has ended: on startup and daily.
-const purgeFreeTier = () => store.purgeFreeTier(config.freeTier.cooldownDays)
-  .then(n => { if (n) log.info('purged expired free-tier hashes', { count: n }); })
+// Purge free-tier hashes whose 30-day (FREE_TIER_COOLDOWN_DAYS) cooldown has ended, plus Stripe event ids
+// older than 30 days: on startup and hourly. Lookups also ignore expired hashes, so the 30 days hold between runs.
+const purgeFreeTier = () => Promise.all([store.purgeFreeTier(config.freeTier.cooldownDays), store.purgeStripeEvents(30)])
+  .then(([n, ev]) => { if (n || ev) log.info('purged expired anti-abuse hashes / stripe events', { count: n, stripe_events: ev }); })
   .catch(e => log.error('free-tier purge failed', { error_message: e.message }));
 purgeFreeTier();
-setInterval(purgeFreeTier, 24 * 60 * 60 * 1000).unref();
+setInterval(purgeFreeTier, 60 * 60 * 1000).unref();
 
 const integrity = config.integrity.configured ? createIntegrityClient(config.integrity) : null;
 const googlePlay = config.billing.configured ? createGooglePlayClient(config.billing) : null;
@@ -72,8 +74,11 @@ const pubsubVerifier = config.billing.configured && config.billing.rtdnAudience
   : null;
 if (!googlePlay) log.warn('billing_not_configured: /api/billing/google-play/* return 503; free one-bank limit still enforced');
 
+const stripe = config.stripe.configured ? createStripeClient(config.stripe.secretKey) : null;
+if (!stripe) log.warn('stripe_not_configured: /api/billing/stripe/* return 503');
+
 const app = createApp({
-  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity,
+  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity, stripe,
   health: () => ({ storage: storageKind, databaseReady: dbReady }),
 });
 
