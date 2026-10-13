@@ -117,6 +117,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   });
 
   // ---------- Google Play Real-time Developer Notifications (Pub/Sub push; public, OIDC-verified) ----------
+  const summaryOpts = { compUids: config.billing?.compUids || new Set() };
   const billingReady = () => Boolean(config.billing?.configured && googlePlay);
   const notConfigured = res => res.status(503).json({ error: 'billing_not_configured', code: 'BILLING_NOT_CONFIGURED' });
 
@@ -165,7 +166,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   billing.get('/status', async (req, res) => {
     try {
-      const s = await billingSummary(store, req.userId);
+      const s = await billingSummary(store, req.userId, Date.now(), summaryOpts);
       res.json({ ...s, billingConfigured: billingReady() });
     } catch (e) {
       log.error('billing status failed', { error_message: e.message });
@@ -191,7 +192,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       }
       res.status(active ? 200 : 402).json({
         ...(active ? {} : { error: 'subscription_inactive', code: 'SUBSCRIPTION_INACTIVE' }),
-        ...(await billingSummary(store, req.userId)), subscriptionState: ent.state,
+        ...(await billingSummary(store, req.userId, Date.now(), summaryOpts)), subscriptionState: ent.state,
       });
     } catch (e) {
       const st = e?.response?.status || e?.status;
@@ -263,8 +264,8 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     if (config.auth?.mode !== 'disabled' && req.authClaims?.email_verified !== true) {
       throw gateError(403, { error: 'email_not_verified', code: 'EMAIL_NOT_VERIFIED' });
     }
-    const s = await billingSummary(store, userId);
-    if (s.plan === 'premium') return { free: false };
+    const s = await billingSummary(store, userId, Date.now(), summaryOpts);
+    if (s.plan === 'premium' || s.plan === 'comp') return { free: false }; // comp/owner: no limit, no device/fingerprint/integrity, no claim
     const limitBody = reason => ({ error: 'subscription_required', code: 'SUBSCRIPTION_REQUIRED', limit: FREE_BANK_LIMIT, linked: s.linkedBanks, ...(reason ? { reason } : {}) });
     if (s.linkedBanks >= FREE_BANK_LIMIT) throw gateError(402, limitBody());
     if (!config.freeTier?.configured) throw gateError(503, { error: 'free_tier_not_configured', code: 'FREE_TIER_NOT_CONFIGURED' });

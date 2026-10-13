@@ -16,20 +16,25 @@ export function isEntitlementActive(e, now = Date.now()) {
 export const activeItems = items => items.filter(i => i.status !== ITEM_STATUS.REVOKED);
 
 /** Summarise a user's plan from their items + entitlements. */
-export async function billingSummary(store, userId, now = Date.now()) {
+/**
+ * Summarise a user's plan. `compUids` (from COMP_FIREBASE_UIDS) marks owner/comp accounts: plan 'comp',
+ * unlimited banks, no subscription needed. Any real entitlement is still reported in expiresAt/productId/state.
+ */
+export async function billingSummary(store, userId, now = Date.now(), { compUids } = {}) {
+  const comp = Boolean(compUids && compUids.has(String(userId)));
   const [items, ents] = await Promise.all([store.getItems(userId), store.getEntitlements(userId)]);
   const linked = activeItems(items).length;
   const active = ents.filter(e => isEntitlementActive(e, now))
     .sort((a, b) => new Date(b.expiresAt) - new Date(a.expiresAt))[0] || null;
   return {
-    plan: active ? 'premium' : 'free',
+    plan: comp ? 'comp' : active ? 'premium' : 'free',
     linkedBanks: linked,
-    limit: active ? null : FREE_BANK_LIMIT,
+    limit: comp || active ? null : FREE_BANK_LIMIT,
     expiresAt: active ? new Date(active.expiresAt).toISOString() : null,
     productId: active?.productId || null,
     state: active?.state || null,
     // Users who linked more than the free limit before it existed keep those banks (they just can't add more).
-    grandfathered: !active && linked > FREE_BANK_LIMIT,
+    grandfathered: !comp && !active && linked > FREE_BANK_LIMIT,
   };
 }
 

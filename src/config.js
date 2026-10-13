@@ -166,6 +166,8 @@ export function loadConfig(env = process.env) {
     productIds: playProductIds,
     rtdnAudience: env.GOOGLE_PLAY_RTDN_AUDIENCE || null,
     rtdnServiceAccountEmail: env.GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT || null,
+    // Owner/comp accounts (Firebase UIDs): unlimited banks, no subscription, skip free-tier checks.
+    compUids: new Set(list(env.COMP_FIREBASE_UIDS)),
   };
   const integrity = {
     enforce: String(env.PLAY_INTEGRITY_ENFORCE || '').trim().toLowerCase() === 'true',
