@@ -10,6 +10,7 @@ import { handleWebhook } from './webhooks.js';
 import { plaidContextMiddleware } from './plaidLog.js';
 import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from './freeTier.js';
 import { checkVerdict } from './integrity.js';
+import { isValidFcmToken, PLATFORMS } from './push.js';
 import { FREE_BANK_LIMIT, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
 
 /** Items in these states cannot be used until the user completes update mode. */
@@ -64,7 +65,7 @@ function decorateAccount(a, item) {
   };
 }
 
-export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null }) {
+export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null, notifyReconnect = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -107,7 +108,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       return res.status(401).json({ error: 'invalid_webhook' });
     }
     try {
-      const { background } = await handleWebhook(payload, { store, syncItem, log });
+      const { background } = await handleWebhook(payload, { store, syncItem, log, notifyReconnect });
       res.json({ received: true });
       background?.catch(e => log.error('webhook background task failed', { item_id: payload.item_id, ...plaidErrorInfo(e) }));
     } catch (e) {
@@ -203,6 +204,44 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   });
 
   app.use('/api/billing', billing);
+
+  // ---------- Device push tokens (signed-in; works without Plaid configured) ----------
+  const devices = express.Router();
+  devices.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max, standardHeaders: 'draft-8', legacyHeaders: false }));
+  devices.use(express.json({ limit: '16kb' }));
+  devices.use(requireAuth(tokenVerifier, { log }));
+  devices.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: 60, keyGenerator: req => req.userId || ipKeyGenerator(req.ip), standardHeaders: 'draft-8', legacyHeaders: false }));
+  const maxTokens = config.push?.maxTokensPerUser || 10;
+  const badToken = res => res.status(400).json({ error: 'invalid_token', code: 'INVALID_FCM_TOKEN' });
+
+  devices.post('/fcm', async (req, res) => {
+    const token = req.body?.token;
+    if (!isValidFcmToken(token)) return badToken(res);
+    const platform = req.body?.platform === undefined || req.body?.platform === null ? 'android' : req.body.platform;
+    if (typeof platform !== 'string' || !PLATFORMS.has(platform)) return res.status(400).json({ error: 'invalid_platform', code: 'INVALID_PLATFORM' });
+    try {
+      const { count, evicted } = await store.upsertFcmToken(req.userId, token, platform, maxTokens);
+      log.info('fcm token registered', { user_id: req.userId, platform, devices: count, evicted });
+      res.json({ registered: true, devices: count, max_devices: maxTokens, push_configured: Boolean(notifyReconnect) });
+    } catch (e) {
+      log.error('fcm token register failed', { user_id: req.userId, error_message: e.message });
+      res.status(500).json({ error: 'register_failed', code: 'FCM_REGISTER_FAILED' });
+    }
+  });
+
+  devices.delete('/fcm', async (req, res) => {
+    const token = req.body?.token;
+    if (!isValidFcmToken(token)) return badToken(res);
+    try {
+      const removed = await store.deleteFcmToken(req.userId, token);
+      log.info('fcm token unregistered', { user_id: req.userId, removed });
+      res.json({ unregistered: true, removed });
+    } catch (e) {
+      log.error('fcm token unregister failed', { user_id: req.userId, error_message: e.message });
+      res.status(500).json({ error: 'unregister_failed', code: 'FCM_UNREGISTER_FAILED' });
+    }
+  });
+  app.use('/api/devices', devices);
 
   // ---------- Authenticated API ----------
   const api = express.Router();

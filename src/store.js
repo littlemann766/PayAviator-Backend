@@ -81,6 +81,12 @@ export class PgStore {
     await q('CREATE INDEX IF NOT EXISTS billing_entitlements_user_idx ON billing_entitlements(user_id)');
 
     // Free-tier fingerprints: keyed HMACs only. released_at set when the bank/account is deleted; purged after the cooldown.
+    await q(`CREATE TABLE IF NOT EXISTS fcm_tokens (
+      token TEXT PRIMARY KEY, user_id TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'android',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    await q('CREATE INDEX IF NOT EXISTS fcm_tokens_user_idx ON fcm_tokens(user_id)');
+    await q(`CREATE TABLE IF NOT EXISTS push_dedupe (
+      item_id TEXT PRIMARY KEY, sent_at TIMESTAMPTZ NOT NULL)`);
     await q(`CREATE TABLE IF NOT EXISTS free_tier_claims (
       kind TEXT NOT NULL, hash TEXT NOT NULL, user_id TEXT NOT NULL, item_id TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW(), released_at TIMESTAMPTZ,
@@ -198,6 +204,7 @@ export class PgStore {
       await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('DELETE FROM plaid_pending_links WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('DELETE FROM plaid_items WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
+      await client.query('DELETE FROM push_dedupe WHERE item_id=$1', [itemId]);
       await this.releaseFreeTierItem(itemId, client); // keep hashes for the cooldown, then purge
       await client.query('COMMIT');
     } catch (e) {
@@ -215,6 +222,8 @@ export class PgStore {
       await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE user_id=$1 AND NOT (item_id = ANY($2))', [userId, keepItemIds]);
       await client.query('DELETE FROM plaid_items WHERE user_id=$1 AND NOT (item_id = ANY($2))', [userId, keepItemIds]);
       await client.query('DELETE FROM plaid_pending_links WHERE user_id=$1', [userId]);
+      await client.query('DELETE FROM push_dedupe d WHERE NOT EXISTS (SELECT 1 FROM plaid_items p WHERE p.item_id=d.item_id)');
+      await client.query('DELETE FROM fcm_tokens WHERE user_id=$1', [userId]);
       await this.releaseFreeTierUser(userId, keepItemIds, client);
       await client.query('COMMIT');
     } catch (e) {
@@ -322,6 +331,45 @@ export class PgStore {
       [tokenHash, userId, itemId]);
   }
 
+  // ---------- FCM device tokens + push dedupe ----------
+  /** Upserts token for userId (a token moving to a new account is reassigned) and trims to the newest `max`. */
+  async upsertFcmToken(userId, token, platform, max) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`INSERT INTO fcm_tokens(token,user_id,platform) VALUES($1,$2,$3)
+        ON CONFLICT (token) DO UPDATE SET user_id=EXCLUDED.user_id, platform=EXCLUDED.platform, updated_at=now()`, [token, userId, platform]);
+      const r = await client.query(`DELETE FROM fcm_tokens WHERE user_id=$1 AND token IN (
+        SELECT token FROM fcm_tokens WHERE user_id=$1 ORDER BY updated_at DESC, created_at DESC OFFSET $2)`, [userId, max]);
+      const c = await client.query('SELECT count(*)::int AS n FROM fcm_tokens WHERE user_id=$1', [userId]);
+      await client.query('COMMIT');
+      return { count: c.rows[0].n, evicted: r.rowCount };
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { client.release(); }
+  }
+  async deleteFcmToken(userId, token) {
+    const r = await this.pool.query('DELETE FROM fcm_tokens WHERE user_id=$1 AND token=$2', [userId, token]);
+    return r.rowCount > 0;
+  }
+  async getFcmTokens(userId) {
+    const r = await this.pool.query('SELECT token FROM fcm_tokens WHERE user_id=$1 ORDER BY updated_at DESC', [userId]);
+    return r.rows.map(x => x.token);
+  }
+  async deleteFcmTokens(tokens) {
+    if (!tokens.length) return 0;
+    return (await this.pool.query('DELETE FROM fcm_tokens WHERE token = ANY($1)', [tokens])).rowCount;
+  }
+  /** Atomically claims the item's push slot if none was used in the last `windowMs`. */
+  async claimPushSlot(itemId, windowMs, now = Date.now()) {
+    const r = await this.pool.query(`INSERT INTO push_dedupe(item_id, sent_at) VALUES($1, to_timestamp($2/1000.0))
+      ON CONFLICT (item_id) DO UPDATE SET sent_at=EXCLUDED.sent_at
+      WHERE push_dedupe.sent_at <= to_timestamp(($2 - $3)/1000.0) RETURNING item_id`, [itemId, now, windowMs]);
+    return r.rowCount > 0;
+  }
+  async releasePushSlot(itemId) { await this.pool.query('DELETE FROM push_dedupe WHERE item_id=$1', [itemId]); }
+
   async close() { await this.pool.end(); }
 }
 
@@ -336,6 +384,9 @@ export class MemoryStore {
     this.exchanged = new Map();
     this.entitlements = new Map(); // tokenHash -> entitlement
     this.claims = new Map(); // `${kind}|${hash}|${userId}` -> {kind,hash,userId,itemId,releasedAt}
+    this.fcmTokens = new Map(); // token -> {userId, platform, createdAt, updatedAt, seq}
+    this.pushDedupe = new Map(); // itemId -> sentAt ms
+    this.seq = 0;
   }
   async findFreeTierConflict(userId, fps) {
     const want = new Set(fps.map(f => `${f.kind}|${f.hash}`));
@@ -378,6 +429,7 @@ export class MemoryStore {
     this.items.delete(itemId);
     for (const [id, t] of this.transactions) if (t.itemId === itemId) this.transactions.delete(id);
     await this.releaseFreeTierItem(itemId);
+    this.pushDedupe.delete(itemId);
     for (const [h, e] of this.exchanged) if (e.itemId === itemId && e.userId === userId) this.exchanged.delete(h);
     const p = this.pending.get(userId); if (p && p.itemId === itemId) this.pending.delete(userId);
   }
@@ -387,6 +439,8 @@ export class MemoryStore {
     for (const [id, t] of this.transactions) if (t.userId === userId && !keep.has(t.itemId)) this.transactions.delete(id);
     for (const [h, x] of this.exchanged) if (x.userId === userId && !keep.has(x.itemId)) this.exchanged.delete(h);
     this.pending.delete(userId);
+    for (const id of this.pushDedupe.keys()) if (!this.items.has(id)) this.pushDedupe.delete(id);
+    for (const [t, v] of this.fcmTokens) if (v.userId === userId) this.fcmTokens.delete(t);
     await this.releaseFreeTierUser(userId, keepItemIds);
   }
   async setItemStatus(itemId, status, errorCode = null) {
@@ -419,6 +473,30 @@ export class MemoryStore {
   async clearPending(userId) { this.pending.delete(userId); }
   async getExchanged(h) { return this.exchanged.get(h) || null; }
   async markExchanged(h, userId, itemId) { if (!this.exchanged.has(h)) this.exchanged.set(h, { userId, itemId }); }
+  async upsertFcmToken(userId, token, platform, max) {
+    const prev = this.fcmTokens.get(token);
+    this.fcmTokens.set(token, { userId, platform, createdAt: prev?.createdAt ?? Date.now(), seq: ++this.seq });
+    const mine = [...this.fcmTokens.entries()].filter(([, v]) => v.userId === userId).sort((a, b) => b[1].seq - a[1].seq);
+    const extra = mine.slice(max);
+    for (const [t] of extra) this.fcmTokens.delete(t);
+    return { count: mine.length - extra.length, evicted: extra.length };
+  }
+  async deleteFcmToken(userId, token) {
+    const v = this.fcmTokens.get(token);
+    if (!v || v.userId !== userId) return false;
+    return this.fcmTokens.delete(token);
+  }
+  async getFcmTokens(userId) {
+    return [...this.fcmTokens.entries()].filter(([, v]) => v.userId === userId).sort((a, b) => b[1].seq - a[1].seq).map(([t]) => t);
+  }
+  async deleteFcmTokens(tokens) { let n = 0; for (const t of tokens) if (this.fcmTokens.delete(t)) n++; return n; }
+  async claimPushSlot(itemId, windowMs, now = Date.now()) {
+    const last = this.pushDedupe.get(itemId);
+    if (last !== undefined && last > now - windowMs) return false;
+    this.pushDedupe.set(itemId, now);
+    return true;
+  }
+  async releasePushSlot(itemId) { this.pushDedupe.delete(itemId); }
   async encryptLegacyTokens() { return 0; }
   async close() {}
 }

@@ -8,6 +8,7 @@ import { createWebhookVerifier } from './src/webhookVerify.js';
 import { PgStore, MemoryStore } from './src/store.js';
 import { createSyncer } from './src/sync.js';
 import { createApp } from './src/app.js';
+import { createMessagingClient, createReconnectNotifier } from './src/push.js';
 import { createIntegrityClient } from './src/integrity.js';
 import { createGooglePlayClient, createPubSubVerifier } from './src/billing.js';
 
@@ -72,9 +73,15 @@ const pubsubVerifier = config.billing.configured && config.billing.rtdnAudience
   : null;
 if (!googlePlay) log.warn('billing_not_configured: /api/billing/google-play/* return 503; free one-bank limit still enforced');
 
+let messaging = null;
+try { messaging = await createMessagingClient(config.push); }
+catch (e) { log.error('fcm init failed; bank-reconnect pushes disabled', { error_message: e.message }); }
+if (messaging) log.info('fcm push ready', { project_id: config.push.projectId, credential_source: config.push.credentialSource });
+const notifyReconnect = messaging ? createReconnectNotifier({ store, messaging, log, dedupeMs: config.push.dedupeHours * 3600 * 1000 }) : null;
+
 const app = createApp({
-  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity,
-  health: () => ({ storage: storageKind, databaseReady: dbReady }),
+  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity, notifyReconnect,
+  health: () => ({ storage: storageKind, databaseReady: dbReady, pushConfigured: Boolean(messaging) }),
 });
 
 const server = app.listen(config.port, '0.0.0.0', () => {

@@ -164,3 +164,28 @@ test('PgStore: billing entitlements and free-tier claims (conflict, release, coo
   assert.equal((await raw.query(`SELECT count(*)::int n FROM free_tier_claims WHERE user_id='u3' AND released_at IS NOT NULL`)).rows[0].n, 1);
   await store.close(); await raw.end();
 });
+
+test('PgStore: FCM tokens (upsert, cap, reassign, delete) and push dedupe', { skip: !url && 'TEST_DATABASE_URL not set' }, async () => {
+  const raw = new pg.Pool({ connectionString: url });
+  await raw.query('DROP TABLE IF EXISTS fcm_tokens, push_dedupe');
+  const store = new PgStore({ url, ssl: false }, crypto.randomBytes(32));
+  await store.init();
+  const t = n => `pgInstance${n}:APA91bFAKE${'y'.repeat(30)}${n}`;
+  for (const n of [1, 2, 3]) await store.upsertFcmToken('pu1', t(n), 'android', 2);
+  assert.deepEqual(await store.getFcmTokens('pu1'), [t(3), t(2)]);
+  await store.upsertFcmToken('pu2', t(3), 'ios', 2);
+  assert.deepEqual(await store.getFcmTokens('pu1'), [t(2)]);
+  assert.equal(await store.deleteFcmToken('pu2', t(2)), false);
+  assert.equal(await store.deleteFcmTokens([t(3)]), 1);
+  const now = Date.now();
+  assert.equal(await store.claimPushSlot('pi', 86400000, now), true);
+  assert.equal(await store.claimPushSlot('pi', 86400000, now + 1000), false);
+  assert.equal(await store.claimPushSlot('pi', 86400000, now + 86400001), true);
+  await store.releasePushSlot('pi');
+  assert.equal(await store.claimPushSlot('pi', 86400000, now), true);
+  await store.putItem({ userId: 'pu1', itemId: 'pi', accessToken: 'access-sandbox-x' });
+  await store.deleteUserData('pu1');
+  assert.deepEqual(await store.getFcmTokens('pu1'), []);
+  assert.equal((await raw.query(`SELECT count(*)::int n FROM push_dedupe WHERE item_id='pi'`)).rows[0].n, 0);
+  await store.close(); await raw.end();
+});

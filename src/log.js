@@ -10,6 +10,8 @@ const REDACTIONS = [
   [/enc:v1:[A-Za-z0-9+/=:]+/g, 'enc:v1:[REDACTED]'],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]'],
   [/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g, '[REDACTED_JWT]'],
+  // FCM registration tokens (<instance id>:APA91...).
+  [/\b[A-Za-z0-9_-]{8,}:APA91[A-Za-z0-9_-]+/g, '[REDACTED_FCM_TOKEN]'],
   // Emails. Bounded, non-overlapping character classes: no catastrophic backtracking.
   [/[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,8}/g, '[REDACTED_EMAIL]'],
 ];
@@ -21,7 +23,7 @@ const BLOCKED_KEYS = new Set(['access_token', 'accessToken', 'public_token', 'li
   'balance', 'current', 'available', 'limit', 'amount', 'name', 'official_name', 'merchant_name', 'owners',
   'email', 'emails', 'phone', 'phone_numbers', 'address', 'addresses', 'id_token', 'idToken', 'token',
   'firebase_token', 'refresh_token', 'purchase_token', 'purchaseToken', 'integrity_token', 'password',
-  'Authorization', 'cookie', 'processor_token', 'link_session', 'results', 'on_success', 'metadata']);
+  'Authorization', 'cookie', 'fcm_token', 'fcmToken', 'tokens', 'registration_token', 'registration_ids', 'processor_token', 'link_session', 'results', 'on_success', 'metadata']);
 
 export function redact(value, depth = 0) {
   if (typeof value === 'string') return REDACTIONS.reduce((s, [re, rep]) => s.replace(re, rep), value);
