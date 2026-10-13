@@ -5,7 +5,9 @@ All calls: Authorization: Bearer <Firebase ID token>
 - Over limit (create-link-token / exchange-public-token): 402 {"error":"subscription_required","code":"SUBSCRIPTION_REQUIRED","limit":1,"linked":n}
   hosted-status (add mode): 402 same + connected:false,pending:false,status:"subscription_required"; multi-bank partial: 200 with skipped:{402 body}
 - Relinking existing banks (update-link-token / update-complete) never blocked. Users with 2+ banks already are grandfathered.
-- GET /api/billing/status -> {plan:"free"|"premium"|"comp", linkedBanks, limit:1|null, expiresAt, productId, state, grandfathered, billingConfigured}
+- GET /api/billing/status -> {plan:"free"|"premium"|"comp", linkedBanks, limit:1|null, expiresAt, productId, state, cancelAtPeriodEnd, periodEnd, grandfathered, billingConfigured}
+  - `cancelAtPeriodEnd` (boolean): Stripe subs only; true when the user cancelled and premium stays on until `periodEnd`. Always false for Play/comp/free.
+  - `periodEnd` (ISO 8601 string|null): Stripe subs only; end of the current paid period (same instant as `expiresAt`). null otherwise.
   - `plan:"comp"` = owner/comp account from `COMP_FIREBASE_UIDS` (comma-separated Firebase UIDs): unlimited banks (`limit:null`), no subscription, skips X-Device-Id/fingerprint/Play Integrity checks, records no free-tier claims; `grandfathered` always false. Same shape otherwise; app should treat `comp` like `premium` (hide upgrade).
 - POST /api/billing/google-play/verify {productId, purchaseToken}  (call after each purchase and on app start to restore)
   200 active (+subscriptionState) | 402 subscription_inactive | 400 missing_purchase/unknown_product/product_mismatch/invalid_purchase | 409 purchase_in_use | 502 verify_failed | 503 billing_not_configured
@@ -80,3 +82,5 @@ https://<backend>/api/billing/stripe/webhook with the events above, enable the c
 - Anti-abuse hash expiry: device/bank fingerprints from removed banks or deleted user data are ignored after 30 days
   (FREE_TIER_COOLDOWN_DAYS) and deleted by a cleanup job on startup + hourly. Still-linked banks keep theirs. See docs/PRIVACY-DATA-NOTES.md.
 - Future work (not built): phone-only sign-in. Server still requires a verified email for bank linking; phone-only accounts need that check changed.
+
+- Stripe Checkout is cards only (`payment_method_types:['card']`). New Stripe customers get `customer_email` prefilled from the Firebase token's `email` claim; returning customers reuse their stored Stripe customer.

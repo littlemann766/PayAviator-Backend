@@ -111,13 +111,16 @@ export function stripeRoutes(router, { config, store, stripe, log, summary }) {
       const s = await summary(req.userId);
       if (s.plan !== 'free') return res.status(409).json({ error: 'already_premium', code: 'ALREADY_PREMIUM', source: s.source });
       const customer = await store.getStripeCustomer(req.userId);
+      const rawEmail = req.authClaims?.email;
+      const email = typeof rawEmail === 'string' && /^[^\s@]+@[^\s@]+$/.test(rawEmail) ? rawEmail : null;
       const session = await stripe.checkout.sessions.create({
         mode: 'subscription',
         line_items: [{ price, quantity: 1 }],
         client_reference_id: req.userId,
         metadata: { uid: req.userId },
         subscription_data: { metadata: { uid: req.userId } },
-        ...(customer ? { customer } : {}),
+        payment_method_types: ['card'], // cards only (no Klarna / BNPL / bank debits)
+        ...(customer ? { customer } : (email ? { customer_email: email } : {})),
         success_url: `${SITE_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${SITE_URL}/billing/cancel`,
       });

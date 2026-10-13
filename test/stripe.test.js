@@ -10,7 +10,7 @@ import { stripeState, stripePeriodEnd, stripeEntitlementKey } from '../src/strip
 const WHSEC = 'whsec_test_secret_for_unit_tests_only';
 const ENV = { STRIPE_SECRET_KEY: 'sk_test_dummy', STRIPE_WEBHOOK_SECRET: WHSEC, STRIPE_PRICE_MONTHLY: 'price_month', STRIPE_PRICE_YEARLY: 'price_year' };
 const webhooks = new Stripe('sk_test_dummy').webhooks; // offline signing/verification helpers only
-const token = sub => new SignJWT({ email_verified: true }).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET));
+const token = (sub, claims = {}) => new SignJWT({ email_verified: true, ...claims }).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET));
 const future = (days = 30) => Math.floor(Date.now() / 1000) + days * 86400;
 
 function fakeStripe(subs = {}) {
@@ -68,6 +68,17 @@ test('checkout requires auth and creates a subscription session bound to the uid
   const m = await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1')}`).send({});
   assert.equal(stripe.calls[1][1].line_items[0].price, 'price_month', 'monthly is the default'); assert.equal(m.status, 200);
   assert.equal((await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1')}`).send({ plan: 'weekly' })).status, 400);
+  assert.deepEqual(p.payment_method_types, ['card']); assert.equal(p.customer_email, undefined, 'no email claim -> no customer_email');
+});
+
+test('checkout passes customer_email for new customers, customer for existing ones', async () => {
+  const { app, store, stripe } = setup();
+  await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1', { email: 'a@b.co' })}`).send({});
+  let p = stripe.calls[0][1]; assert.equal(p.customer_email, 'a@b.co'); assert.equal(p.customer, undefined);
+  await store.putStripeCustomer('u1', 'cus_1');
+  await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1', { email: 'a@b.co' })}`).send({});
+  p = stripe.calls[1][1]; assert.equal(p.customer, 'cus_1'); assert.equal(p.customer_email, undefined);
+  assert.deepEqual(p.payment_method_types, ['card']);
 });
 
 test('webhook rejects bad / missing signatures', async () => {
@@ -82,6 +93,7 @@ test('checkout.session.completed unlocks premium (source stripe) and is idempote
   const s = await status(app);
   assert.equal(s.plan, 'premium'); assert.equal(s.source, 'stripe'); assert.equal(s.limit, null);
   assert.equal(s.productId, 'price_month'); assert.equal(s.state, 'SUBSCRIPTION_STATE_ACTIVE'); assert.ok(s.expiresAt);
+  assert.equal(s.cancelAtPeriodEnd, false); assert.equal(s.periodEnd, s.expiresAt);
   assert.equal(await store.getStripeCustomer('u1'), 'cus_1');
   const dup = await send(app, completed());
   assert.equal(dup.status, 200); assert.equal(dup.body.duplicate, true);
@@ -97,9 +109,11 @@ test('subscription.updated (cancel at period end) keeps premium; deleted ends it
   stripe.subs.sub_1 = sub({ cancel_at_period_end: true });
   await send(app, { id: 'evt_2', type: 'customer.subscription.updated', data: { object: stripe.subs.sub_1 } });
   let s = await status(app); assert.equal(s.plan, 'premium'); assert.equal(s.state, 'SUBSCRIPTION_STATE_CANCELED');
+  assert.equal(s.cancelAtPeriodEnd, true); assert.ok(s.periodEnd);
   stripe.subs.sub_1 = sub({ status: 'canceled', metadata: {} });
   await send(app, { id: 'evt_3', type: 'customer.subscription.deleted', data: { object: stripe.subs.sub_1 } });
   s = await status(app); assert.equal(s.plan, 'free'); assert.equal(s.source, null); assert.equal(s.limit, 1);
+  assert.equal(s.cancelAtPeriodEnd, false); assert.equal(s.periodEnd, null);
 });
 
 test('invoice.payment_failed -> grace period while Stripe retries, then unpaid -> free', async () => {
@@ -132,7 +146,7 @@ test('active Play OR active Stripe is premium; no migration needed between them'
   const store = new MemoryStore();
   const { app } = setup({ store });
   await store.putEntitlement({ tokenHash: 'playhash', userId: 'u1', productId: 'payaviator_premium', platform: 'google_play', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: new Date(Date.now() + 86400e3).toISOString() });
-  assert.equal((await status(app)).source, 'play');
+  const ps = await status(app); assert.equal(ps.source, 'play'); assert.equal(ps.cancelAtPeriodEnd, false); assert.equal(ps.periodEnd, null);
   await store.putEntitlement({ tokenHash: 'playhash', userId: 'u1', productId: 'payaviator_premium', platform: 'google_play', state: 'SUBSCRIPTION_STATE_EXPIRED', expiresAt: new Date(Date.now() - 1000).toISOString() });
   assert.equal((await status(app)).plan, 'free');
   await send(app, completed());

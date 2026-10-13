@@ -35,6 +35,11 @@ export async function billingSummary(store, userId, now = Date.now(), { compUids
     expiresAt: active ? new Date(active.expiresAt).toISOString() : null,
     productId: active?.productId || null,
     state: active?.state || null,
+    // Stripe only: true when the user cancelled and premium stays on until periodEnd (stripeState maps
+    // cancel_at_period_end=true onto SUBSCRIPTION_STATE_CANCELED). Always false for Play / comp / free.
+    cancelAtPeriodEnd: Boolean(!comp && active?.platform === 'stripe' && active.state === 'SUBSCRIPTION_STATE_CANCELED'),
+    // Stripe only: end of the current paid period (ISO 8601), else null.
+    periodEnd: !comp && active?.platform === 'stripe' && active.expiresAt ? new Date(active.expiresAt).toISOString() : null,
     // Users who linked more than the free limit before it existed keep those banks (they just can't add more).
     grandfathered: !comp && !active && linked > FREE_BANK_LIMIT,
   };
