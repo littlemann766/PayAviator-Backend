@@ -73,7 +73,7 @@ Optional for the app (helps Plaid support trace a failed link; nothing breaks wi
   customer.subscription.created/updated/deleted, invoice.payment_failed, invoice.paid. Event ids stored (idempotent, kept 30 days).
   400 invalid_signature | 500 webhook_failed (Stripe retries) | 503 stripe_not_configured
 - All Stripe routes return 503 stripe_not_configured unless all four env vars are set, so it is safe to deploy before Stripe exists.
-Env: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_MONTHLY ($2.99/mo), STRIPE_PRICE_YEARLY ($29.99/yr)
+Env: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_MONTHLY ($3.99/mo; actual price comes from the Stripe price id), STRIPE_PRICE_YEARLY ($29.99/yr)
 Website calling from the browser: add https://payaviator.app to CORS_ORIGINS.
 Boss setup (Stripe Dashboard, when approved): create product + 2 prices, webhook endpoint
 https://<backend>/api/billing/stripe/webhook with the events above, enable the customer portal with "cancel subscription" (one-click cancel).
