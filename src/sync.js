@@ -33,7 +33,7 @@ export function createSyncer({ store, plaid, log, maxPages = 100, maxRestarts = 
         while (hasMore) {
           if (pages >= maxPages) throw Object.assign(new Error('transactions sync exceeded max pages'), { code: 'SYNC_MAX_PAGES' });
           const req = { access_token: item.accessToken, count: 500, ...(cursor ? { cursor } : {}) };
-          const d = await plaid.call('transactionsSync', req);
+          const d = await plaid.call('transactionsSync', req, { ctx: { itemId: item.itemId, userId: item.userId } });
           for (const t of [...(d.added || []), ...(d.modified || [])]) {
             removed.delete(String(t.transaction_id));
             upserts.set(String(t.transaction_id), normalizeTransaction(t, item));

@@ -7,6 +7,7 @@ import { requireAuth, enforceUserMatch } from './auth.js';
 import { clientError, plaidErrorInfo, itemErrorCode, statusForItemError, ITEM_STATUS } from './plaid.js';
 import { sha256Hex } from './crypto.js';
 import { handleWebhook } from './webhooks.js';
+import { plaidContextMiddleware } from './plaidLog.js';
 import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from './freeTier.js';
 import { checkVerdict } from './integrity.js';
 import { FREE_BANK_LIMIT, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
@@ -73,7 +74,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   app.use(cors({
     origin: (origin, cb) => cb(null, !origin || allowed.has(origin)),
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'X-Device-Id', 'X-Play-Integrity-Token'],
+    allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'X-Device-Id', 'X-Play-Integrity-Token', 'X-Link-Session-Id'],
     maxAge: 600,
   }));
   app.use((req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
@@ -207,6 +208,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   api.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max * 2, standardHeaders: 'draft-8', legacyHeaders: false })); // per-IP, before auth
   api.use(express.json({ limit: '100kb' }));
   api.use(requireAuth(tokenVerifier, { log }));
+  api.use(plaidContextMiddleware); // user_ref + optional link_session_id on every Plaid log line
   const userKey = req => req.userId || ipKeyGenerator(req.ip);
   api.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max, keyGenerator: userKey, standardHeaders: 'draft-8', legacyHeaders: false }));
   const linkLimiter = rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.linkMax, keyGenerator: userKey, standardHeaders: 'draft-8', legacyHeaders: false });
@@ -302,7 +304,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       const d = await plaid.call('linkTokenCreate', linkTokenRequest(req.userId, {
         access_token: item.accessToken, // update mode: no products
         ...(item.newAccountsAvailable ? { update: { account_selection_enabled: true } } : {}),
-      }));
+      }), { ctx: { itemId } });
       await store.putPending(req.userId, d.link_token, { mode: 'update', itemId });
       res.json({ ...linkResponse(d), mode: 'update', item_id: itemId });
     } catch (e) { fail(res, e, 'update link token create failed', 'Could not start reconnecting this bank.', 'LINK_TOKEN_FAILED'); }
@@ -316,15 +318,15 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       return { connected: true, item_id: prior.itemId, institution: metadata?.institution?.name || null, duplicate_exchange: true };
     }
     const gate = await linkGate(req, userId); // before exchange: no new Plaid Item is created over the limit
-    const ex = await plaid.call('itemPublicTokenExchange', { public_token: publicToken }, { idempotent: false });
+    const ex = await plaid.call('itemPublicTokenExchange', { public_token: publicToken }, { idempotent: false, ctx: { userId } });
     const institution = metadata?.institution || {};
     let fps = [];
     if (gate.free) {
       // Fingerprint the real accounts BEFORE storing this as the user's free bank.
-      const removeAtPlaid = () => plaid.call('itemRemove', { access_token: ex.access_token })
+      const removeAtPlaid = () => plaid.call('itemRemove', { access_token: ex.access_token }, { ctx: { itemId: ex.item_id } })
         .catch(e => log.error('item remove after free-tier rejection failed', { item_id: ex.item_id, ...plaidErrorInfo(e) }));
       let acc;
-      try { acc = await plaid.call('accountsGet', { access_token: ex.access_token }); } catch (e) { await removeAtPlaid(); throw e; }
+      try { acc = await plaid.call('accountsGet', { access_token: ex.access_token }, { ctx: { itemId: ex.item_id } }); } catch (e) { await removeAtPlaid(); throw e; }
       const instId = acc?.item?.institution_id || institution.institution_id || institution.id || '';
       fps = accountFingerprints(config.freeTier.secret, instId, acc?.accounts || []);
       if (await store.findFreeTierConflict(userId, fps)) {
@@ -347,7 +349,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   async function completeUpdate(userId, itemId) {
     const item = (await store.getItems(userId)).find(i => i.itemId === itemId);
     if (!item) return { ok: false, status: 404, body: { error: 'Connection not found.', code: 'ITEM_NOT_FOUND' } };
-    const d = await plaid.call('itemGet', { access_token: item.accessToken });
+    const d = await plaid.call('itemGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
     const err = d?.item?.error;
     if (err && err.error_code) {
       await store.setItemStatus(itemId, statusForItemError(err.error_code, err.error_code_reason), err.error_code);
@@ -467,7 +469,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       for (const item of items) {
         if (BLOCKED_STATUSES.has(item.status)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: item.errorCode || item.status, message: 'Reconnect this bank to refresh its balance.', needs_update: true }); continue; }
         try {
-          const d = await plaid.call('accountsGet', { access_token: item.accessToken });
+          const d = await plaid.call('accountsGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
           for (const a of d.accounts) accounts.push(decorateAccount(a, item));
         } catch (e) {
           const code = itemErrorCode(e);
@@ -487,7 +489,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   /** Calls /item/remove; "already gone" at Plaid counts as removed. Throws on other errors. */
   async function removeAtPlaid(item) {
     try {
-      await plaid.call('itemRemove', { access_token: item.accessToken });
+      await plaid.call('itemRemove', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
     } catch (e) {
       const code = e?.response?.data?.error_code;
       if (!['ITEM_NOT_FOUND', 'INVALID_ACCESS_TOKEN'].includes(code)) throw e;
@@ -561,7 +563,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       const items = await store.getItems(req.userId), status = [];
       for (const item of items) {
         try {
-          const d = await plaid.call('itemGet', { access_token: item.accessToken });
+          const d = await plaid.call('itemGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
           status.push({ ...itemSummary(item), billed_products: d?.item?.billed_products || [], available_products: d?.item?.available_products || [], has_transactions_cursor: Boolean(item.transactionsCursor) });
         } catch (e) {
           log.error('item get failed', { item_id: item.itemId, ...plaidErrorInfo(e) });

@@ -41,7 +41,7 @@ export async function cleanupLegacyItems({ pool, plaid, key, apply = false }) {
     try {
       const accessToken = decryptToken(row.access_token, key);
       if (accessToken) {
-        try { await plaid.call('itemRemove', { access_token: accessToken }); removedAtPlaid++; }
+        try { await plaid.call('itemRemove', { access_token: accessToken }, { ctx: { itemId: row.item_id } }); removedAtPlaid++; }
         catch (e) {
           if (!GONE_AT_PLAID.has(e?.response?.data?.error_code)) throw e;
           alreadyGone++;

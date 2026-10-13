@@ -3,6 +3,7 @@ import { loadConfig, ConfigError } from './src/config.js';
 import { log } from './src/log.js';
 import { createTokenVerifier } from './src/auth.js';
 import { createPlaidClient } from './src/plaid.js';
+import { instrumentPlaid } from './src/plaidLog.js';
 import { createWebhookVerifier } from './src/webhookVerify.js';
 import { PgStore, MemoryStore } from './src/store.js';
 import { createSyncer } from './src/sync.js';
@@ -22,7 +23,7 @@ try {
 }
 for (const w of warnings) log.warn(w);
 
-const plaid = createPlaidClient(config.plaid, { log });
+const plaid = instrumentPlaid(createPlaidClient(config.plaid, { log }), log); // one plaid_api JSON line per call
 
 let store;
 let dbReady = false;
