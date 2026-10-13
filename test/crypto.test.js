@@ -7,7 +7,7 @@ import { MemoryStore } from '../src/store.js';
 const key = crypto.randomBytes(32);
 
 test('AES-256-GCM round trip with enc:v1 prefix and random IV', () => {
-  const token = 'access-sandbox-12345678-aaaa-bbbb-cccc-1234567890ab';
+  const token = 'access-sandbox-FAKE-TEST-FIXTURE-NOT-A-REAL-TOKEN';
   const a = encryptToken(token, key), b = encryptToken(token, key);
   assert.ok(a.startsWith(TOKEN_PREFIX));
   assert.notEqual(a, b);
