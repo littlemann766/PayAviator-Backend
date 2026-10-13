@@ -9,7 +9,7 @@ import { createApp } from '../src/app.js';
 import { createTokenVerifier } from '../src/auth.js';
 import { testConfig, fakePlaid, JWT_SECRET } from './helpers.js';
 
-const SECRETS = ['access-production-11111111-2222-3333-4444-555555555555', 'public-sandbox-aaaa-bbbb-cccc',
+const SECRETS = ['access-production-FAKE-TEST-FIXTURE-NOT-REAL', 'public-sandbox-aaaa-bbbb-cccc',
   'link-production-9999-8888', 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl', 'robert@example.com',
   'Robert Lawson', 'Chase Checking', '1234.56', 'Starbucks'];
 
