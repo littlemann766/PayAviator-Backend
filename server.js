@@ -65,6 +65,12 @@ const purgeFreeTier = () => Promise.all([store.purgeFreeTier(config.freeTier.coo
   .then(([n, ev]) => { if (n || ev) log.info('purged expired anti-abuse hashes / stripe events', { count: n, stripe_events: ev }); })
   .catch(e => log.error('free-tier purge failed', { error_message: e.message }));
 purgeFreeTier();
+// Cloud-sync tombstones older than 90 days: on startup and hourly.
+const purgeSync = () => store.purgeSyncTombstones()
+  .then(n => { if (n) log.info('purged old sync tombstones', { count: n }); })
+  .catch(e => log.error('sync tombstone purge failed', { error_message: e.message }));
+purgeSync();
+setInterval(purgeSync, 60 * 60 * 1000).unref();
 setInterval(purgeFreeTier, 60 * 60 * 1000).unref();
 
 const integrity = config.integrity.configured ? createIntegrityClient(config.integrity) : null;

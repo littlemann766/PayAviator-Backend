@@ -3,6 +3,9 @@ import crypto from 'node:crypto';
 import { encryptToken, decryptToken, isEncrypted, TOKEN_PREFIX } from './crypto.js';
 import { ITEM_STATUS } from './plaid.js';
 import { isLegacyUserId } from './legacy.js';
+import { applyPush, publicItem, SYNC_LIMITS } from './cloudSync.js';
+
+const rowToSync = x => ({ kind: x.kind, id: x.id, data: x.data, deleted: Boolean(x.deleted), updatedAt: Number(x.updated_at), seq: Number(x.seq) });
 
 function rowToItem(x, key) {
   return {
@@ -94,7 +97,53 @@ export class PgStore {
     await q(`CREATE TABLE IF NOT EXISTS stripe_events (
       event_id TEXT PRIMARY KEY, type TEXT NOT NULL, processed_at TIMESTAMPTZ DEFAULT NOW())`);
 
+    // Cloud sync: per-user items (bills, income, ...). Tombstones (deleted=true) keep data '{}' and are purged after 90 days.
+    await q(`CREATE TABLE IF NOT EXISTS sync_items (
+      user_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at BIGINT NOT NULL, deleted BOOLEAN NOT NULL DEFAULT FALSE, seq BIGSERIAL,
+      PRIMARY KEY (user_id, kind, id))`);
+    await q('CREATE INDEX IF NOT EXISTS sync_items_user_seq_idx ON sync_items(user_id, seq)');
+
     await this.encryptLegacyTokens();
+  }
+
+  /** Items changed after `since` (seq), oldest first, tombstones included. */
+  async syncChanges(userId, since = 0, limit = SYNC_LIMITS.maxChangesLimit) {
+    const lim = Math.max(1, Math.min(Number(limit) || SYNC_LIMITS.maxChangesLimit, SYNC_LIMITS.maxChangesLimit));
+    const r = await this.pool.query('SELECT * FROM sync_items WHERE user_id=$1 AND seq>$2 ORDER BY seq LIMIT $3', [userId, Math.max(0, Number(since) || 0), lim + 1]);
+    const more = r.rows.length > lim;
+    const items = r.rows.slice(0, lim).map(rowToSync).map(publicItem);
+    return { items, next: items.length ? items[items.length - 1].seq : Math.max(0, Number(since) || 0), more };
+  }
+
+  /** Applies a push under a per-user advisory lock so seq order == commit order for that user. */
+  async syncPush(userId, items, now = Date.now()) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`sync:${userId}`]);
+      const tx = {
+        count: async () => Number((await client.query('SELECT COUNT(*) AS n FROM sync_items WHERE user_id=$1', [userId])).rows[0].n),
+        getRow: async (kind, id) => { const r = await client.query('SELECT * FROM sync_items WHERE user_id=$1 AND kind=$2 AND id=$3', [userId, kind, id]); return r.rows[0] ? rowToSync(r.rows[0]) : null; },
+        insert: it => client.query('INSERT INTO sync_items(user_id,kind,id,data,updated_at,deleted) VALUES($1,$2,$3,$4,$5,$6)', [userId, it.kind, it.id, JSON.stringify(it.data ?? {}), it.updatedAt, it.deleted]),
+        update: it => client.query(`UPDATE sync_items SET data=$4, updated_at=$5, deleted=$6, seq=nextval(pg_get_serial_sequence('sync_items','seq')) WHERE user_id=$1 AND kind=$2 AND id=$3`, [userId, it.kind, it.id, JSON.stringify(it.data ?? {}), it.updatedAt, it.deleted]),
+      };
+      const results = await applyPush(tx, items, now);
+      await client.query('COMMIT');
+      return results;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { client.release(); }
+  }
+
+  async syncDeleteAll(userId, client = this.pool) {
+    return (await client.query('DELETE FROM sync_items WHERE user_id=$1', [userId])).rowCount;
+  }
+
+  /** Tombstones older than `days` are no longer needed by devices that synced within that window. */
+  async purgeSyncTombstones(days = SYNC_LIMITS.tombstoneDays, now = Date.now()) {
+    return (await this.pool.query('DELETE FROM sync_items WHERE deleted AND updated_at < $1', [now - Math.floor(days) * 86400e3])).rowCount;
   }
 
   async putStripeCustomer(userId, customerId) {
@@ -246,6 +295,7 @@ export class PgStore {
       await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE user_id=$1 AND NOT (item_id = ANY($2))', [userId, keepItemIds]);
       await client.query('DELETE FROM plaid_items WHERE user_id=$1 AND NOT (item_id = ANY($2))', [userId, keepItemIds]);
       await client.query('DELETE FROM plaid_pending_links WHERE user_id=$1', [userId]);
+      await this.syncDeleteAll(userId, client);
       await this.releaseFreeTierUser(userId, keepItemIds, client);
       await client.query('COMMIT');
     } catch (e) {
@@ -369,6 +419,44 @@ export class MemoryStore {
     this.stripeCustomers = new Map(); // userId -> customerId
     this.stripeEvents = new Map(); // eventId -> {type, at}
     this.claims = new Map(); // `${kind}|${hash}|${userId}` -> {kind,hash,userId,itemId,releasedAt}
+    this.syncRows = new Map(); // `${userId}|${kind}|${id}` -> {userId,kind,id,data,updatedAt,deleted,seq}
+    this.syncSeq = 0;
+    this.syncLock = Promise.resolve();
+  }
+  async syncChanges(userId, since = 0, limit = SYNC_LIMITS.maxChangesLimit) {
+    const lim = Math.max(1, Math.min(Number(limit) || SYNC_LIMITS.maxChangesLimit, SYNC_LIMITS.maxChangesLimit));
+    const s = Math.max(0, Number(since) || 0);
+    const rows = [...this.syncRows.values()].filter(r => r.userId === userId && r.seq > s).sort((a, b) => a.seq - b.seq);
+    const items = rows.slice(0, lim).map(publicItem);
+    return { items, next: items.length ? items[items.length - 1].seq : s, more: rows.length > lim };
+  }
+  async syncPush(userId, items, now = Date.now()) {
+    const run = async () => {
+      const staged = new Map(); // all-or-nothing like the PG transaction
+      const key = (k, i) => `${userId}|${k}|${i}`;
+      const tx = {
+        count: async () => [...this.syncRows.values()].filter(r => r.userId === userId).length,
+        getRow: async (k, i) => { const r = staged.get(key(k, i)) || this.syncRows.get(key(k, i)); return r ? { ...r } : null; },
+        insert: async it => { staged.set(key(it.kind, it.id), { ...it, userId, seq: 0 }); },
+        update: async it => { staged.set(key(it.kind, it.id), { ...it, userId, seq: 0 }); },
+      };
+      const out = await applyPush(tx, items, now);
+      for (const [k, r] of staged) this.syncRows.set(k, { ...r, seq: ++this.syncSeq });
+      return out;
+    };
+    const p = this.syncLock.then(run, run);
+    this.syncLock = p.catch(() => {});
+    return p;
+  }
+  async syncDeleteAll(userId) {
+    let n = 0;
+    for (const [k, r] of this.syncRows) if (r.userId === userId) { this.syncRows.delete(k); n++; }
+    return n;
+  }
+  async purgeSyncTombstones(days = SYNC_LIMITS.tombstoneDays, now = Date.now()) {
+    let n = 0;
+    for (const [k, r] of this.syncRows) if (r.deleted && r.updatedAt < now - Math.floor(days) * 86400e3) { this.syncRows.delete(k); n++; }
+    return n;
   }
   async findFreeTierConflict(userId, fps, cooldownDays = 30, now = Date.now()) {
     const want = new Set(fps.map(f => `${f.kind}|${f.hash}`));
@@ -427,6 +515,7 @@ export class MemoryStore {
     for (const [id, t] of this.transactions) if (t.userId === userId && !keep.has(t.itemId)) this.transactions.delete(id);
     for (const [h, x] of this.exchanged) if (x.userId === userId && !keep.has(x.itemId)) this.exchanged.delete(h);
     this.pending.delete(userId);
+    await this.syncDeleteAll(userId);
     await this.releaseFreeTierUser(userId, keepItemIds);
   }
   async setItemStatus(itemId, status, errorCode = null) {

@@ -68,6 +68,7 @@ export const ITEM_STATUS = {
   PENDING_DISCONNECT: 'pending_disconnect',
   PENDING_EXPIRATION: 'pending_expiration',
   REVOKED: 'revoked',
+  PAUSED: 'paused', // virtual: derived per request when the user has no active Plus (never stored)
 };
 
 /** Item error codes that mean the user must re-authenticate via update mode. */

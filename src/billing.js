@@ -15,7 +15,26 @@ export function isEntitlementActive(e, now = Date.now()) {
 
 export const activeItems = items => items.filter(i => i.status !== ITEM_STATUS.REVOKED);
 
-/** Summarise a user's plan from their items + entitlements. */
+export const PAUSE_REASON = 'plus_ended';
+
+/**
+ * Pause rule: without an active entitlement (premium or comp), only the OLDEST non-revoked item stays active; every
+ * other non-revoked item is shown as status 'paused' (virtual, computed per request, nothing stored, so it
+ * auto-resumes the moment a premium entitlement is active). `items` must be ordered oldest first (store.getItems).
+ * Returns copies; paused ones carry status 'paused' and pausedFrom (the real status).
+ */
+export function applyPause(items, entitled) {
+  if (entitled) return items;
+  let keptOne = false;
+  return items.map(i => {
+    if (i.status === ITEM_STATUS.REVOKED) return i;
+    if (!keptOne) { keptOne = true; return i; }
+    return { ...i, status: ITEM_STATUS.PAUSED, pausedFrom: i.status };
+  });
+}
+
+export const isPaused = i => i?.status === ITEM_STATUS.PAUSED;
+
 /**
  * Summarise a user's plan. `compUids` (from COMP_FIREBASE_UIDS) marks owner/comp accounts: plan 'comp',
  * unlimited banks, no subscription needed. Any real entitlement is still reported in expiresAt/productId/state.
@@ -41,7 +60,10 @@ export async function billingSummary(store, userId, now = Date.now(), { compUids
     // Stripe only: end of the current paid period (ISO 8601), else null.
     periodEnd: !comp && active?.platform === 'stripe' && active.expiresAt ? new Date(active.expiresAt).toISOString() : null,
     // Users who linked more than the free limit before it existed keep those banks (they just can't add more).
+    // Same condition as before. With the pause rule, grandfathered now means: extra banks exist but are paused (see pausedBanks).
     grandfathered: !comp && !active && linked > FREE_BANK_LIMIT,
+    // Active banks that are paused because there is no Plus/comp entitlement (all but the oldest). 0 when entitled.
+    pausedBanks: comp || active ? 0 : Math.max(0, linked - FREE_BANK_LIMIT),
   };
 }
 

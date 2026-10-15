@@ -6,13 +6,15 @@ import { plaidWebhookFields, withPlaidContext } from './plaidLog.js';
  * on DB failure); transaction syncs run in the background and are returned as
  * `background` so the HTTP response is not delayed.
  */
-export async function handleWebhook(payload, { store, syncItem, log }) {
+export async function handleWebhook(payload, { store, syncItem, log, isPaused = null }) {
   const { webhook_type: type, webhook_code: code, item_id: itemId } = payload || {};
   const ctx = { webhook_type: type, webhook_code: code, item_id: itemId, environment: payload?.environment };
   const item = itemId ? await store.getItemById(itemId) : null;
   if (itemId && !item) { log.warn('plaid_webhook', plaidWebhookFields(payload, { outcome: 'unknown_item' })); return {}; }
   log.info('plaid_webhook', plaidWebhookFields(payload, { userId: item?.userId }));
   if (type === 'TRANSACTIONS' && code === 'SYNC_UPDATES_AVAILABLE') {
+    // Paused (no Plus): do not pull; the cursor stays so a later resume syncs everything missed.
+    if (isPaused && await isPaused(item)) { log.info('plaid_webhook', plaidWebhookFields(payload, { userId: item?.userId, outcome: 'paused_skipped' })); return {}; }
     return { background: withPlaidContext({ userId: item?.userId, itemId }, () => syncItem(item)) };
   }
 

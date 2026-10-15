@@ -11,7 +11,8 @@ import { plaidContextMiddleware } from './plaidLog.js';
 import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from './freeTier.js';
 import { checkVerdict } from './integrity.js';
 import { stripeRoutes, stripeWebhookRoute } from './stripeBilling.js';
-import { FREE_BANK_LIMIT, billingSummary, entitlementFromPurchase, isEntitlementActive } from './billing.js';
+import { FREE_BANK_LIMIT, PAUSE_REASON, billingSummary, entitlementFromPurchase, isEntitlementActive, applyPause, isPaused } from './billing.js';
+import { SYNC_LIMITS } from './cloudSync.js';
 
 /** Items in these states cannot be used until the user completes update mode. */
 const BLOCKED_STATUSES = new Set([ITEM_STATUS.LOGIN_REQUIRED, ITEM_STATUS.REVOKED]);
@@ -33,7 +34,9 @@ export function itemSummary(i) {
     institution_name: i.institutionName,
     status: i.status,
     error_code: i.errorCode,
-    needs_update: BLOCKED_STATUSES.has(i.status) || i.status === ITEM_STATUS.PENDING_EXPIRATION || i.status === ITEM_STATUS.PENDING_DISCONNECT || i.newAccountsAvailable,
+    paused: i.status === ITEM_STATUS.PAUSED,
+    pause_reason: i.status === ITEM_STATUS.PAUSED ? PAUSE_REASON : null,
+    needs_update: i.status !== ITEM_STATUS.PAUSED && (BLOCKED_STATUSES.has(i.status) || i.status === ITEM_STATUS.PENDING_EXPIRATION || i.status === ITEM_STATUS.PENDING_DISCONNECT || i.newAccountsAvailable),
     new_accounts_available: i.newAccountsAvailable,
   };
 }
@@ -108,7 +111,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       return res.status(401).json({ error: 'invalid_webhook' });
     }
     try {
-      const { background } = await handleWebhook(payload, { store, syncItem, log });
+      const { background } = await handleWebhook(payload, { store, syncItem, log, isPaused: itemIsPaused });
       res.json({ received: true });
       background?.catch(e => log.error('webhook background task failed', { item_id: payload.item_id, ...plaidErrorInfo(e) }));
     } catch (e) {
@@ -119,6 +122,13 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   // ---------- Google Play Real-time Developer Notifications (Pub/Sub push; public, OIDC-verified) ----------
   const summaryOpts = { compUids: config.billing?.compUids || new Set() };
+  /** The user's items with the Plus-ended pause rule applied (see billing.applyPause). Nothing is stored. */
+  async function pausedAwareItems(userId) {
+    const [items, s] = await Promise.all([store.getItems(userId), billingSummary(store, userId, Date.now(), summaryOpts)]);
+    return applyPause(items, s.plan === 'premium' || s.plan === 'comp');
+  }
+  const itemIsPaused = async item => isPaused((await pausedAwareItems(item.userId)).find(i => i.itemId === item.itemId));
+  const pausedBody = item => ({ error: 'This bank is paused until Plus is active again.', code: 'ITEM_PAUSED', item_id: item.itemId, pause_reason: PAUSE_REASON });
   const billingReady = () => Boolean(config.billing?.configured && googlePlay);
   const notConfigured = res => res.status(503).json({ error: 'billing_not_configured', code: 'BILLING_NOT_CONFIGURED' });
 
@@ -209,6 +219,43 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   stripeRoutes(billing, { config, store, stripe, log, summary: uid => billingSummary(store, uid, Date.now(), summaryOpts) });
 
   app.use('/api/billing', billing);
+
+  // ---------- Cloud sync (signed-in; separate router so the 512 KB body limit applies to /api/sync only) ----------
+  const syncRouter = express.Router();
+  syncRouter.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max * 2, standardHeaders: 'draft-8', legacyHeaders: false })); // per-IP, before auth
+  syncRouter.use(express.json({ limit: SYNC_LIMITS.bodyLimit }));
+  syncRouter.use(requireAuth(tokenVerifier, { log }));
+  syncRouter.use((req, res, next) => {
+    if (config.auth?.mode !== 'disabled' && req.authClaims?.email_verified !== true) return res.status(403).json({ error: 'Verify your email first.', code: 'EMAIL_NOT_VERIFIED' });
+    next();
+  });
+  const syncUserKey = req => req.userId || ipKeyGenerator(req.ip);
+  syncRouter.use(rateLimit({ windowMs: config.rateLimit.windowMs, limit: config.rateLimit.max, keyGenerator: syncUserKey, standardHeaders: 'draft-8', legacyHeaders: false }));
+  const pushLimiter = rateLimit({ windowMs: config.rateLimit.windowMs, limit: Number(config.rateLimit.syncPushMax) || 60, keyGenerator: syncUserKey, standardHeaders: 'draft-8', legacyHeaders: false });
+  const syncFail = (res, e, ctx) => { log.error(ctx, { error_message: e.message }); res.status(500).json({ error: 'Sync is temporarily unavailable.', code: 'SYNC_FAILED' }); };
+
+  // userId only ever comes from the verified token (req.userId); any userId in query/body is ignored.
+  syncRouter.get('/changes', async (req, res) => {
+    const since = req.query.since === undefined ? 0 : Number(req.query.since);
+    const limit = req.query.limit === undefined ? SYNC_LIMITS.maxChangesLimit : Number(req.query.limit);
+    if (!Number.isSafeInteger(since) || since < 0 || !Number.isSafeInteger(limit) || limit < 1) return res.status(400).json({ error: 'Invalid since or limit.', code: 'INVALID_QUERY' });
+    try { res.json(await store.syncChanges(req.userId, since, Math.min(limit, SYNC_LIMITS.maxChangesLimit))); }
+    catch (e) { syncFail(res, e, 'sync changes failed'); }
+  });
+
+  syncRouter.post('/push', pushLimiter, async (req, res) => {
+    const items = req.body?.items;
+    if (!Array.isArray(items)) return res.status(400).json({ error: 'items must be an array.', code: 'INVALID_BODY' });
+    if (items.length > SYNC_LIMITS.maxPushItems) return res.status(413).json({ error: `At most ${SYNC_LIMITS.maxPushItems} items per push.`, code: 'TOO_MANY_ITEMS', max: SYNC_LIMITS.maxPushItems });
+    try { res.json({ results: await store.syncPush(req.userId, items) }); }
+    catch (e) { syncFail(res, e, 'sync push failed'); }
+  });
+
+  syncRouter.delete('/all', pushLimiter, async (req, res) => {
+    try { res.json({ deleted: await store.syncDeleteAll(req.userId) }); }
+    catch (e) { syncFail(res, e, 'sync delete failed'); }
+  });
+  app.use('/api/sync', syncRouter);
 
   // ---------- Authenticated API ----------
   const api = express.Router();
@@ -305,8 +352,10 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   api.post('/plaid/update-link-token', linkLimiter, enforceUserMatch, async (req, res) => {
     const itemId = String(req.body?.item_id || '');
     if (!itemId) return res.status(400).json({ error: 'Missing item_id.', code: 'MISSING_ITEM_ID' });
-    const item = (await store.getItems(req.userId)).find(i => i.itemId === itemId);
+    let item;
+    try { item = (await pausedAwareItems(req.userId)).find(i => i.itemId === itemId); } catch (e) { return res.status(500).json({ error: 'Could not check your plan.', code: 'BILLING_CHECK_FAILED' }); }
     if (!item) return res.status(404).json({ error: 'Connection not found.', code: 'ITEM_NOT_FOUND' });
+    if (isPaused(item)) return res.status(402).json(pausedBody(item));
     try {
       const d = await plaid.call('linkTokenCreate', linkTokenRequest(req.userId, {
         access_token: item.accessToken, // update mode: no products
@@ -470,10 +519,11 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   api.get(['/plaid/accounts', '/plaid/accounts/:userId'], enforceUserMatch, async (req, res) => {
     try {
-      const items = await store.getItems(req.userId);
+      const items = await pausedAwareItems(req.userId);
       if (!items.length) return res.json({ accounts: [], items: [], errors: [] });
       const accounts = [], errors = [];
       for (const item of items) {
+        if (isPaused(item)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: 'ITEM_PAUSED', message: 'Paused. Resubscribe to Plus to sync this bank.', needs_update: false, paused: true, pause_reason: PAUSE_REASON }); continue; }
         if (BLOCKED_STATUSES.has(item.status)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: item.errorCode || item.status, message: 'Reconnect this bank to refresh its balance.', needs_update: true }); continue; }
         try {
           const d = await plaid.call('accountsGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
@@ -544,11 +594,12 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   api.get(['/plaid/transactions', '/plaid/transactions/:userId'], enforceUserMatch, async (req, res) => {
     try {
-      const items = await store.getItems(req.userId);
+      const items = await pausedAwareItems(req.userId);
       const refresh = !['0', 'false'].includes(String(req.query.refresh ?? '1'));
       const sync = [], errors = [];
       if (refresh) {
         for (const item of items) {
+          if (isPaused(item)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: 'ITEM_PAUSED', needs_update: false, paused: true, pause_reason: PAUSE_REASON }); continue; }
           if (BLOCKED_STATUSES.has(item.status)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: item.errorCode || item.status, needs_update: true }); continue; }
           try { sync.push(await syncItem(item)); }
           catch (e) {
@@ -567,8 +618,9 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   api.get(['/plaid/transactions-status', '/plaid/transactions-status/:userId'], enforceUserMatch, async (req, res) => {
     try {
-      const items = await store.getItems(req.userId), status = [];
+      const items = await pausedAwareItems(req.userId), status = [];
       for (const item of items) {
+        if (isPaused(item)) { status.push({ ...itemSummary(item), billed_products: [], available_products: [], has_transactions_cursor: Boolean(item.transactionsCursor) }); continue; } // no Plaid call
         try {
           const d = await plaid.call('itemGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
           status.push({ ...itemSummary(item), billed_products: d?.item?.billed_products || [], available_products: d?.item?.available_products || [], has_transactions_cursor: Boolean(item.transactionsCursor) });

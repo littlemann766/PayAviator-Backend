@@ -186,3 +186,35 @@ test('PgStore: stripe customers, event idempotency and event purge', { skip: !ur
   assert.equal(await store.purgeStripeEvents(30), 1);
   await store.close(); await raw.end();
 });
+
+test('PgStore: cloud sync (LWW, tombstones, seq, purge, wipe, concurrency)', { skip: !url && 'TEST_DATABASE_URL not set' }, async () => {
+  const store = new PgStore({ url, ssl: false }, crypto.randomBytes(32));
+  await store.init(); await store.init(); // CREATE IF NOT EXISTS is idempotent
+  const raw = new pg.Pool({ connectionString: url });
+  await raw.query(`DELETE FROM sync_items WHERE user_id IN ('pu1','pu2')`);
+  const now = Date.now();
+  const mk = (id, v, t, extra = {}) => ({ kind: 'bill', id, data: { v }, updatedAt: t, ...extra });
+  assert.deepEqual((await store.syncPush('pu1', [mk('a', 1, now - 1000), mk('b', 1, now - 1000)], now)).map(r => r.status), ['accepted', 'accepted']);
+  const r2 = await store.syncPush('pu1', [mk('a', 2, now - 500), mk('b', 0, now - 2000)], now);
+  assert.equal(r2[0].status, 'accepted'); assert.equal(r2[1].status, 'rejected'); assert.equal(r2[1].winner.data.v, 1);
+  await store.syncPush('pu1', [{ kind: 'bill', id: 'b', deleted: true, updatedAt: now }], now);
+  const ch = await store.syncChanges('pu1', 0, 500);
+  assert.deepEqual(ch.items.map(i => [i.id, i.deleted, i.data]), [['a', false, { v: 2 }], ['b', true, null]]);
+  assert.ok(ch.items[0].seq < ch.items[1].seq && typeof ch.next === 'number');
+  assert.equal((await store.syncChanges('pu1', ch.items[0].seq, 500)).items.length, 1);
+  assert.equal((await store.syncChanges('pu1', 0, 1)).more, true);
+  await store.syncPush('pu2', [mk('a', 9, now)], now);
+  assert.equal((await store.syncChanges('pu2')).items[0].data.v, 9);
+  // concurrent pushes serialise per user; newest wins
+  await Promise.all(Array.from({ length: 8 }, (_, i) => store.syncPush('pu1', [mk('c', i, now + i)], now)));
+  assert.equal((await store.syncChanges('pu1')).items.find(i => i.id === 'c').data.v, 7);
+  // purge only old tombstones
+  await store.syncPush('pu1', [{ kind: 'bill', id: 'old', deleted: true, updatedAt: now - 95 * 86400e3 }], now);
+  assert.equal(await store.purgeSyncTombstones(90, now), 1);
+  // deleteUserData wipes sync rows too
+  await store.deleteUserData('pu1');
+  assert.equal((await store.syncChanges('pu1')).items.length, 0);
+  assert.equal((await store.syncChanges('pu2')).items.length, 1);
+  assert.equal(await store.syncDeleteAll('pu2'), 1);
+  await raw.end(); await store.close();
+});

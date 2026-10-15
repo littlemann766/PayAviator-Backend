@@ -69,7 +69,10 @@ test('grandfathered user with 2 banks keeps them, can relink, cannot add a third
   assert.equal(s.status, 200);
   assert.equal(s.body.linkedBanks, 2);
   assert.equal(s.body.grandfathered, true);
-  assert.equal((await request(app).post('/api/plaid/update-link-token').set('Authorization', auth).send({ item_id: 'item-2' })).status, 200);
+  assert.equal(s.body.pausedBanks, 1, 'extra bank is paused without Plus');
+  assert.equal((await request(app).post('/api/plaid/update-link-token').set('Authorization', auth).send({ item_id: 'item-1' })).status, 200);
+  const paused = await request(app).post('/api/plaid/update-link-token').set('Authorization', auth).send({ item_id: 'item-2' });
+  assert.equal(paused.status, 402); assert.equal(paused.body.code, 'ITEM_PAUSED');
   const r = await request(app).post('/api/plaid/create-link-token').set('Authorization', auth).send({});
   assert.equal(r.status, 402);
   assert.equal(r.body.linked, 2);
