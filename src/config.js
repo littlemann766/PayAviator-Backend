@@ -191,6 +191,33 @@ export function loadConfig(env = process.env) {
   if (integrity.enforce && !integrity.configured) warnings.push('PLAY_INTEGRITY_ENFORCE=true but GOOGLE_PLAY_SERVICE_ACCOUNT_JSON/ANDROID_PACKAGE_NAME missing: free-tier links return 503 integrity_not_configured');
   if (isProduction && !billing.configured) warnings.push('Google Play billing not configured (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON + ANDROID_PACKAGE_NAME); second bank links will be refused');
 
+  // --- FCM push (optional: missing => pushes are logged and skipped; FCM itself is free, no Blaze needed) ---
+  let fcmServiceAccount = null, fcmCredentialSource = null;
+  if (env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const raw = String(env.FIREBASE_SERVICE_ACCOUNT_JSON).trim();
+      fcmServiceAccount = JSON.parse(raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8'));
+      if (!fcmServiceAccount.client_email || !fcmServiceAccount.private_key) throw new Error('missing client_email/private_key');
+      fcmCredentialSource = 'FIREBASE_SERVICE_ACCOUNT_JSON';
+    } catch (e) {
+      fcmServiceAccount = null;
+      warnings.push(`FIREBASE_SERVICE_ACCOUNT_JSON is invalid (${e.message}); push notifications disabled`);
+    }
+  } else if (playServiceAccount && truthy(env.FCM_USE_PLAY_SERVICE_ACCOUNT)) {
+    fcmServiceAccount = playServiceAccount; fcmCredentialSource = 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON';
+  }
+  const fcmProjectId = String(env.FCM_PROJECT_ID || env.FIREBASE_PROJECT_ID || fcmServiceAccount?.project_id || '').trim();
+  const maxTokens = Number(env.FCM_MAX_TOKENS_PER_USER || 10);
+  const push = {
+    configured: Boolean(fcmServiceAccount && fcmProjectId) && !truthy(env.PUSH_DISABLED),
+    serviceAccount: fcmServiceAccount,
+    credentialSource: fcmCredentialSource,
+    projectId: fcmProjectId || null,
+    maxTokensPerUser: Number.isInteger(maxTokens) && maxTokens > 0 && maxTokens <= 50 ? maxTokens : 10,
+    dedupeHours: 24,
+  };
+  if (!push.configured) warnings.push('push_not_configured: FIREBASE_SERVICE_ACCOUNT_JSON (+ FIREBASE_PROJECT_ID) missing; bank-reconnect pushes are logged and skipped');
+
   if (errors.length) throw new ConfigError(errors);
 
   return {
@@ -222,6 +249,7 @@ export function loadConfig(env = process.env) {
       freeTier,
       stripe,
       integrity,
+      push,
       rateLimit: {
         windowMs: 15 * 60 * 1000,
         max: Number(env.RATE_LIMIT_MAX || 300),

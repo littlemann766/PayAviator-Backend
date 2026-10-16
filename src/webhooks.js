@@ -6,7 +6,15 @@ import { plaidWebhookFields, withPlaidContext } from './plaidLog.js';
  * on DB failure); transaction syncs run in the background and are returned as
  * `background` so the HTTP response is not delayed.
  */
-export async function handleWebhook(payload, { store, syncItem, log, isPaused = null }) {
+/** Webhook codes that mean the user must reconnect: push them (reason = value sent in data.reason). */
+export function reconnectReason(type, code, payload) {
+  if (type !== 'ITEM') return null;
+  if (code === 'ERROR' && payload?.error?.error_code === 'ITEM_LOGIN_REQUIRED') return 'ITEM_LOGIN_REQUIRED';
+  if (code === 'PENDING_EXPIRATION' || code === 'PENDING_DISCONNECT') return code;
+  return null;
+}
+
+export async function handleWebhook(payload, { store, syncItem, log, notifyReconnect = null, isPaused = null }) {
   const { webhook_type: type, webhook_code: code, item_id: itemId } = payload || {};
   const ctx = { webhook_type: type, webhook_code: code, item_id: itemId, environment: payload?.environment };
   const item = itemId ? await store.getItemById(itemId) : null;
@@ -53,6 +61,12 @@ export async function handleWebhook(payload, { store, syncItem, log, isPaused = 
         break;
       default:
         break; // WEBHOOK_UPDATE_ACKNOWLEDGED etc.: logged only
+    }
+    // Push after the status is stored; runs in the background so Plaid gets its 200 immediately.
+    const reason = reconnectReason(type, code, payload);
+    if (reason && item) {
+      if (!notifyReconnect) { log.info('push skipped', { user_id: item.userId, item_id: itemId, reason, outcome: 'not_configured' }); return {}; }
+      return { background: notifyReconnect(item, reason) };
     }
   }
   return {};

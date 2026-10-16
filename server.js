@@ -8,6 +8,7 @@ import { createWebhookVerifier } from './src/webhookVerify.js';
 import { PgStore, MemoryStore } from './src/store.js';
 import { createSyncer } from './src/sync.js';
 import { createApp } from './src/app.js';
+import { createMessagingClient, createReconnectNotifier } from './src/push.js';
 import { createIntegrityClient } from './src/integrity.js';
 import { createStripeClient } from './src/stripeBilling.js';
 import { createGooglePlayClient, createPubSubVerifier } from './src/billing.js';
@@ -83,9 +84,15 @@ if (!googlePlay) log.warn('billing_not_configured: /api/billing/google-play/* re
 const stripe = config.stripe.configured ? createStripeClient(config.stripe.secretKey) : null;
 if (!stripe) log.warn('stripe_not_configured: /api/billing/stripe/* return 503');
 
+let messaging = null;
+try { messaging = await createMessagingClient(config.push); }
+catch (e) { log.error('fcm init failed; bank-reconnect pushes disabled', { error_message: e.message }); }
+if (messaging) log.info('fcm push ready', { project_id: config.push.projectId, credential_source: config.push.credentialSource });
+const notifyReconnect = messaging ? createReconnectNotifier({ store, messaging, log, dedupeMs: config.push.dedupeHours * 3600 * 1000 }) : null;
+
 const app = createApp({
-  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity, stripe,
-  health: () => ({ storage: storageKind, databaseReady: dbReady }),
+  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity, stripe, notifyReconnect,
+  health: () => ({ storage: storageKind, databaseReady: dbReady, pushConfigured: Boolean(messaging) }),
 });
 
 const server = app.listen(config.port, '0.0.0.0', () => {
