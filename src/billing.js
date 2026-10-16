@@ -39,13 +39,16 @@ export const isPaused = i => i?.status === ITEM_STATUS.PAUSED;
  * Summarise a user's plan. `compUids` (from COMP_FIREBASE_UIDS) marks owner/comp accounts: plan 'comp',
  * unlimited banks, no subscription needed. Any real entitlement is still reported in expiresAt/productId/state.
  */
-export async function billingSummary(store, userId, now = Date.now(), { compUids } = {}) {
-  const comp = Boolean(compUids && compUids.has(String(userId)));
+export async function billingSummary(store, userId, now = Date.now(), { compUids, founderUids } = {}) {
+  const founder = Boolean(founderUids && founderUids.has(String(userId)));
+  const comp = founder || Boolean(compUids && compUids.has(String(userId)));
   const [items, ents] = await Promise.all([store.getItems(userId), store.getEntitlements(userId)]);
   const linked = activeItems(items).length;
   const active = ents.filter(e => isEntitlementActive(e, now))
     .sort((a, b) => new Date(b.expiresAt) - new Date(a.expiresAt))[0] || null;
   return {
+    // Display tier: 'founder' | 'elite' (comp) | 'plus' (paying) | 'free'. plan/source stay 'comp' for founder+elite.
+    tier: founder ? 'founder' : comp ? 'elite' : active ? 'plus' : 'free',
     plan: comp ? 'comp' : active ? 'premium' : 'free',
     // What unlocked premium: 'comp' | 'play' | 'stripe' | null (free). Whichever store is active wins; no migration.
     source: comp ? 'comp' : active ? (active.platform === 'stripe' ? 'stripe' : 'play') : null,

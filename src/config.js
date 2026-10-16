@@ -167,7 +167,9 @@ export function loadConfig(env = process.env) {
     rtdnAudience: env.GOOGLE_PLAY_RTDN_AUDIENCE || null,
     rtdnServiceAccountEmail: env.GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT || null,
     // Owner/comp accounts (Firebase UIDs): unlimited banks, no subscription, skip free-tier checks.
-    compUids: new Set(list(env.COMP_FIREBASE_UIDS)),
+    // Founders (FOUNDER_FIREBASE_UIDS) always count as comp too; they additionally get tier 'founder'.
+    compUids: new Set([...list(env.COMP_FIREBASE_UIDS), ...list(env.FOUNDER_FIREBASE_UIDS)]),
+    founderUids: new Set(list(env.FOUNDER_FIREBASE_UIDS)),
   };
   // --- Stripe web subscriptions (optional: all four required, else /api/billing/stripe/* return 503) ---
   const stripeVars = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICE_MONTHLY', 'STRIPE_PRICE_YEARLY'];

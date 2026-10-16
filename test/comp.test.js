@@ -41,3 +41,29 @@ test('non-comp user is unaffected by COMP_FIREBASE_UIDS', async () => {
   assert.equal(s.body.plan, 'free'); assert.equal(s.body.limit, 1);
   assert.equal((await request(app).post('/api/plaid/create-link-token').set('Authorization', `Bearer ${await token('u2')}`).send({})).status, 400);
 });
+
+test('FOUNDER_FIREBASE_UIDS parses a trimmed list and implies comp', () => {
+  const c = testConfig({ COMP_FIREBASE_UIDS: 'e1', FOUNDER_FIREBASE_UIDS: ' f1 ,,' });
+  assert.deepEqual([...c.billing.founderUids], ['f1']);
+  assert.deepEqual([...c.billing.compUids].sort(), ['e1', 'f1']);
+  assert.equal(testConfig().billing.founderUids.size, 0);
+});
+
+test('tier field: founder, elite, free, founder-only-in-founder-list', async () => {
+  const { app } = buildApp({ plaid: plaid(), config: testConfig({ COMP_FIREBASE_UIDS: 'elite1,both1', FOUNDER_FIREBASE_UIDS: 'both1,founderOnly1' }) });
+  const get = async u => (await request(app).get('/api/billing/status').set('Authorization', `Bearer ${await token(u)}`)).body;
+  for (const [u, tier] of [['both1', 'founder'], ['founderOnly1', 'founder'], ['elite1', 'elite'], ['rando', 'free']]) {
+    const b = await get(u);
+    assert.equal(b.tier, tier, u);
+    if (tier !== 'free') { assert.equal(b.plan, 'comp'); assert.equal(b.source, 'comp'); assert.equal(b.limit, null); }
+    else { assert.equal(b.plan, 'free'); assert.equal(b.source, null); }
+  }
+});
+
+test('tier plus for a paying (non-comp) user', async () => {
+  const { billingSummary } = await import('../src/billing.js');
+  const exp = new Date(Date.now() + 86400000).toISOString();
+  const store = { getItems: async () => [], getEntitlements: async () => [{ platform: 'stripe', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: exp, productId: 'p' }] };
+  const s = await billingSummary(store, 'payer1', Date.now(), { compUids: new Set(['x']), founderUids: new Set(['y']) });
+  assert.equal(s.tier, 'plus'); assert.equal(s.plan, 'premium');
+});

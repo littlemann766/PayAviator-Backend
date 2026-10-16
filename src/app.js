@@ -121,7 +121,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
   });
 
   // ---------- Google Play Real-time Developer Notifications (Pub/Sub push; public, OIDC-verified) ----------
-  const summaryOpts = { compUids: config.billing?.compUids || new Set() };
+  const summaryOpts = { compUids: config.billing?.compUids || new Set(), founderUids: config.billing?.founderUids || new Set() };
   /** The user's items with the Plus-ended pause rule applied (see billing.applyPause). Nothing is stored. */
   async function pausedAwareItems(userId) {
     const [items, s] = await Promise.all([store.getItems(userId), billingSummary(store, userId, Date.now(), summaryOpts)]);
