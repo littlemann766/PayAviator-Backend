@@ -171,6 +171,16 @@ export function loadConfig(env = process.env) {
     compUids: new Set([...list(env.COMP_FIREBASE_UIDS), ...list(env.FOUNDER_FIREBASE_UIDS)]),
     founderUids: new Set(list(env.FOUNDER_FIREBASE_UIDS)),
   };
+  // --- Live Plaid balance (accountsBalanceGet, ~$0.10/call): manual refresh only, tightly capped. Non-negative ints; invalid => default.
+  const nonNeg = (v, d) => { const n = Number(String(v ?? '').trim() === '' ? NaN : v); return Number.isFinite(n) && n >= 0 ? Math.floor(n) : d; };
+  const liveBalance = {
+    cooldownSec: nonNeg(env.LIVE_BALANCE_COOLDOWN_SEC, 900),        // per bank (item)
+    itemDailyCap: nonNeg(env.LIVE_BALANCE_ITEM_DAILY_CAP, 3),       // per bank per UTC day
+    itemMonthlyCap: nonNeg(env.LIVE_BALANCE_ITEM_MONTHLY_CAP, 10),  // per bank per UTC month
+    userDailyCap: nonNeg(env.LIVE_BALANCE_USER_DAILY_CAP, 5),       // paying (Plus) users, per UTC day
+    freeUserDailyCap: nonNeg(env.LIVE_BALANCE_FREE_USER_DAILY_CAP, 0), // free + comp/tester/founder users (0 = no live calls)
+    globalDailyCap: nonNeg(env.LIVE_BALANCE_DAILY_CAP, 200),        // all users, per UTC day
+  };
   // --- Stripe web subscriptions (optional: all four required, else /api/billing/stripe/* return 503) ---
   const stripeVars = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICE_MONTHLY', 'STRIPE_PRICE_YEARLY'];
   const stripeSet = stripeVars.filter(k => String(env[k] || '').trim());
@@ -246,6 +256,7 @@ export function loadConfig(env = process.env) {
       auth,
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
       billing,
+      liveBalance,
       freeTier,
       stripe,
       integrity,

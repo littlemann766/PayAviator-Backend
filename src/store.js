@@ -37,6 +37,17 @@ export function stripSslParams(url) {
   } catch { return url; }
 }
 
+/** Pure limit check shared by both stores. counts: globalDay,userDay,itemDay,itemMonth,itemLast(ms|null). */
+export function decideLive(c, limits, now) {
+  if (!(limits.userCap > 0)) return { ok: false, reason: 'plan_not_eligible' };
+  if (c.globalDay >= limits.globalDailyCap) return { ok: false, reason: 'global_daily_cap' };
+  if (c.userDay >= limits.userCap) return { ok: false, reason: 'user_daily_cap' };
+  if (c.itemLast != null && now - c.itemLast < limits.cooldownSec * 1000) return { ok: false, reason: 'cooldown', retryAfterSec: Math.ceil((limits.cooldownSec * 1000 - (now - c.itemLast)) / 1000) };
+  if (c.itemDay >= limits.itemDailyCap) return { ok: false, reason: 'item_daily_cap' };
+  if (c.itemMonth >= limits.itemMonthlyCap) return { ok: false, reason: 'item_monthly_cap' };
+  return { ok: true };
+}
+
 export class PgStore {
   constructor({ url, ssl }, key, { log } = {}) {
     this.key = key;
@@ -110,7 +121,71 @@ export class PgStore {
       PRIMARY KEY (user_id, kind, id))`);
     await q('CREATE INDEX IF NOT EXISTS sync_items_user_seq_idx ON sync_items(user_id, seq)');
 
+    // Cached balances per Item (Plaid account objects: balances only, never tokens) with source + as-of time.
+    await q(`CREATE TABLE IF NOT EXISTS plaid_item_balances (
+      item_id TEXT PRIMARY KEY, accounts JSONB NOT NULL, source TEXT NOT NULL, as_of TIMESTAMPTZ NOT NULL)`);
+    // Audit log of every live accountsBalanceGet attempt (billable at Plaid) for invoice reconciliation. Kept after account deletion.
+    await q(`CREATE TABLE IF NOT EXISTS live_balance_calls (
+      id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT NOT NULL, plan TEXT,
+      called_at TIMESTAMPTZ NOT NULL DEFAULT now(), outcome TEXT NOT NULL DEFAULT 'pending', error_code TEXT)`);
+    await q('CREATE INDEX IF NOT EXISTS live_balance_calls_user_idx ON live_balance_calls(user_id, called_at)');
+    await q('CREATE INDEX IF NOT EXISTS live_balance_calls_item_idx ON live_balance_calls(item_id, called_at)');
+    await q('CREATE INDEX IF NOT EXISTS live_balance_calls_time_idx ON live_balance_calls(called_at)');
+
     await this.encryptLegacyTokens();
+  }
+
+  async getBalances(itemIds) {
+    const out = new Map();
+    if (!itemIds.length) return out;
+    const r = await this.pool.query('SELECT item_id, accounts, source, as_of FROM plaid_item_balances WHERE item_id = ANY($1)', [itemIds]);
+    for (const x of r.rows) out.set(x.item_id, { accounts: x.accounts, source: x.source, asOf: new Date(x.as_of).getTime() });
+    return out;
+  }
+  async putBalances(itemId, accounts, source, asOf = Date.now()) {
+    await this.pool.query(`INSERT INTO plaid_item_balances(item_id, accounts, source, as_of) VALUES($1,$2::jsonb,$3,to_timestamp($4/1000.0))
+      ON CONFLICT (item_id) DO UPDATE SET accounts=EXCLUDED.accounts, source=EXCLUDED.source, as_of=EXCLUDED.as_of`, [itemId, JSON.stringify(accounts), source, asOf]);
+  }
+  /**
+   * Atomically checks the live-balance limits and, if allowed, records a 'pending' call row.
+   * limits: {cooldownSec,itemDailyCap,itemMonthlyCap,userCap,globalDailyCap}. Day/month are UTC.
+   * Returns {ok:true,id} or {ok:false,reason,retryAfterSec?}.
+   */
+  async reserveLiveCall(userId, itemId, plan, limits, now = Date.now()) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(7210001)'); // serialises reservations (low volume, manual taps only)
+      const d = new Date(now);
+      const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+      const monthStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+      const r = await client.query(`SELECT
+        COUNT(*) FILTER (WHERE called_at >= to_timestamp($4/1000.0))::int AS global_day,
+        COUNT(*) FILTER (WHERE user_id=$1 AND called_at >= to_timestamp($4/1000.0))::int AS user_day,
+        COUNT(*) FILTER (WHERE item_id=$2 AND called_at >= to_timestamp($4/1000.0))::int AS item_day,
+        COUNT(*) FILTER (WHERE item_id=$2)::int AS item_month,
+        MAX(called_at) FILTER (WHERE item_id=$2) AS item_last
+        FROM live_balance_calls WHERE called_at >= to_timestamp($3/1000.0)`, [userId, itemId, monthStart, dayStart]);
+      const x = r.rows[0];
+      const verdict = decideLive({ globalDay: x.global_day, userDay: x.user_day, itemDay: x.item_day, itemMonth: x.item_month, itemLast: x.item_last ? new Date(x.item_last).getTime() : null }, limits, now);
+      if (!verdict.ok) { await client.query('ROLLBACK'); return verdict; }
+      const ins = await client.query('INSERT INTO live_balance_calls(user_id, item_id, plan, called_at) VALUES($1,$2,$3,to_timestamp($4/1000.0)) RETURNING id', [userId, itemId, plan, now]);
+      await client.query('COMMIT');
+      return { ok: true, id: String(ins.rows[0].id) };
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { client.release(); }
+  }
+  async finishLiveCall(id, outcome, errorCode = null) {
+    await this.pool.query('UPDATE live_balance_calls SET outcome=$2, error_code=$3 WHERE id=$1', [id, outcome, errorCode]);
+  }
+  /** Remaining live calls for the user today (for UI), by the same counters. */
+  async liveCallCounts(userId, now = Date.now()) {
+    const d = new Date(now);
+    const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+    const r = await this.pool.query('SELECT COUNT(*)::int AS n FROM live_balance_calls WHERE user_id=$1 AND called_at >= to_timestamp($2/1000.0)', [userId, dayStart]);
+    return { userDay: r.rows[0].n };
   }
 
   /** Items changed after `since` (seq), oldest first, tombstones included. */
@@ -285,6 +360,7 @@ export class PgStore {
       await client.query('DELETE FROM plaid_pending_links WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('DELETE FROM plaid_items WHERE user_id=$1 AND item_id=$2', [userId, itemId]);
       await client.query('DELETE FROM push_dedupe WHERE item_id=$1', [itemId]);
+      await client.query('DELETE FROM plaid_item_balances WHERE item_id=$1', [itemId]);
       await this.releaseFreeTierItem(itemId, client); // keep hashes for the cooldown, then purge
       await client.query('COMMIT');
     } catch (e) {
@@ -305,6 +381,7 @@ export class PgStore {
       await this.syncDeleteAll(userId, client);
       await client.query('DELETE FROM push_dedupe d WHERE NOT EXISTS (SELECT 1 FROM plaid_items p WHERE p.item_id=d.item_id)');
       await client.query('DELETE FROM fcm_tokens WHERE user_id=$1', [userId]);
+      await client.query('DELETE FROM plaid_item_balances b WHERE NOT EXISTS (SELECT 1 FROM plaid_items p WHERE p.item_id=b.item_id)');
       await this.releaseFreeTierUser(userId, keepItemIds, client);
       await client.query('COMMIT');
     } catch (e) {
@@ -334,6 +411,7 @@ export class PgStore {
       await client.query('DELETE FROM plaid_transactions WHERE item_id=$1', [itemId]);
       await client.query('DELETE FROM plaid_exchanged_public_tokens WHERE item_id=$1', [itemId]);
       await client.query('DELETE FROM plaid_pending_links WHERE item_id=$1', [itemId]);
+      await client.query('DELETE FROM plaid_item_balances WHERE item_id=$1', [itemId]);
       await client.query(
         `UPDATE plaid_items SET status=$1, error_code=$2, transactions_cursor=NULL, new_accounts_available=FALSE,
            status_updated_at=NOW(), updated_at=NOW() WHERE item_id=$3`, [ITEM_STATUS.REVOKED, errorCode, itemId]);
@@ -472,6 +550,8 @@ export class MemoryStore {
     this.syncLock = Promise.resolve();
     this.fcmTokens = new Map(); // token -> {userId, platform, createdAt, updatedAt, seq}
     this.pushDedupe = new Map(); // itemId -> sentAt ms
+    this.balances = new Map(); // itemId -> {accounts, source, asOf}
+    this.liveCalls = []; // {id,userId,itemId,plan,calledAt,outcome,errorCode}
     this.seq = 0;
   }
   async syncChanges(userId, since = 0, limit = SYNC_LIMITS.maxChangesLimit) {
@@ -558,6 +638,7 @@ export class MemoryStore {
     for (const [id, t] of this.transactions) if (t.itemId === itemId) this.transactions.delete(id);
     await this.releaseFreeTierItem(itemId);
     this.pushDedupe.delete(itemId);
+    this.balances.delete(itemId);
     for (const [h, e] of this.exchanged) if (e.itemId === itemId && e.userId === userId) this.exchanged.delete(h);
     const p = this.pending.get(userId); if (p && p.itemId === itemId) this.pending.delete(userId);
   }
@@ -569,6 +650,7 @@ export class MemoryStore {
     this.pending.delete(userId);
     await this.syncDeleteAll(userId);
     for (const id of this.pushDedupe.keys()) if (!this.items.has(id)) this.pushDedupe.delete(id);
+    for (const id of this.balances.keys()) if (!this.items.has(id)) this.balances.delete(id);
     for (const [t, v] of this.fcmTokens) if (v.userId === userId) this.fcmTokens.delete(t);
     await this.releaseFreeTierUser(userId, keepItemIds);
   }
@@ -577,6 +659,7 @@ export class MemoryStore {
     const x = this.items.get(itemId); if (x) Object.assign(x, { status, error_code: errorCode, status_updated_at: new Date() });
   }
   async revokeItem(itemId, errorCode = 'USER_PERMISSION_REVOKED') {
+    this.balances.delete(itemId);
     for (const [id, t] of this.transactions) if (t.itemId === itemId) this.transactions.delete(id);
     for (const [h, x] of this.exchanged) if (x.itemId === itemId) this.exchanged.delete(h);
     for (const [u, p] of this.pending) if (p.itemId === itemId) this.pending.delete(u);
@@ -626,6 +709,28 @@ export class MemoryStore {
     return true;
   }
   async releasePushSlot(itemId) { this.pushDedupe.delete(itemId); }
+  async getBalances(itemIds) { const m = new Map(); for (const id of itemIds) { const b = this.balances.get(id); if (b) m.set(id, { ...b }); } return m; }
+  async putBalances(itemId, accounts, source, asOf = Date.now()) { this.balances.set(itemId, { accounts: JSON.parse(JSON.stringify(accounts)), source, asOf }); }
+  async reserveLiveCall(userId, itemId, plan, limits, now = Date.now()) {
+    const d = new Date(now);
+    const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()), monthStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+    const inMonth = this.liveCalls.filter(c => c.calledAt >= monthStart), inDay = inMonth.filter(c => c.calledAt >= dayStart);
+    const mine = inMonth.filter(c => c.itemId === itemId);
+    const verdict = decideLive({
+      globalDay: inDay.length, userDay: inDay.filter(c => c.userId === userId).length,
+      itemDay: inDay.filter(c => c.itemId === itemId).length, itemMonth: mine.length,
+      itemLast: mine.length ? Math.max(...mine.map(c => c.calledAt)) : null,
+    }, limits, now);
+    if (!verdict.ok) return verdict;
+    const id = String(++this.seq);
+    this.liveCalls.push({ id, userId, itemId, plan, calledAt: now, outcome: 'pending', errorCode: null });
+    return { ok: true, id };
+  }
+  async finishLiveCall(id, outcome, errorCode = null) { const c = this.liveCalls.find(x => x.id === id); if (c) Object.assign(c, { outcome, errorCode }); }
+  async liveCallCounts(userId, now = Date.now()) {
+    const d = new Date(now), dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+    return { userDay: this.liveCalls.filter(c => c.userId === userId && c.calledAt >= dayStart).length };
+  }
   async encryptLegacyTokens() { return 0; }
   async close() {}
 }

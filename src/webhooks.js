@@ -14,7 +14,7 @@ export function reconnectReason(type, code, payload) {
   return null;
 }
 
-export async function handleWebhook(payload, { store, syncItem, log, notifyReconnect = null, isPaused = null }) {
+export async function handleWebhook(payload, { store, syncItem, log, notifyReconnect = null, isPaused = null, refreshBalances = null }) {
   const { webhook_type: type, webhook_code: code, item_id: itemId } = payload || {};
   const ctx = { webhook_type: type, webhook_code: code, item_id: itemId, environment: payload?.environment };
   const item = itemId ? await store.getItemById(itemId) : null;
@@ -23,11 +23,16 @@ export async function handleWebhook(payload, { store, syncItem, log, notifyRecon
   if (type === 'TRANSACTIONS' && code === 'SYNC_UPDATES_AVAILABLE') {
     // Paused (no Plus): do not pull; the cursor stays so a later resume syncs everything missed.
     if (isPaused && await isPaused(item)) { log.info('plaid_webhook', plaidWebhookFields(payload, { userId: item?.userId, outcome: 'paused_skipped' })); return {}; }
-    return { background: withPlaidContext({ userId: item?.userId, itemId }, () => syncItem(item)) };
+    // Balances are refreshed alongside (free accountsGet); a balance failure must never fail the transaction sync.
+    const refresh = () => (refreshBalances ? Promise.resolve().then(() => refreshBalances(item)).catch(() => {}) : Promise.resolve());
+    return { background: withPlaidContext({ userId: item?.userId, itemId }, () => Promise.all([syncItem(item), refresh()]).then(([r]) => r)) };
   }
 
   if (type === 'TRANSACTIONS') {
-    if (code === 'SYNC_UPDATES_AVAILABLE') return { background: syncItem(item) };
+    // Legacy codes are superseded for transactions, but they still signal fresh balances at the bank.
+    if (['INITIAL_UPDATE', 'HISTORICAL_UPDATE', 'DEFAULT_UPDATE'].includes(code) && refreshBalances && item && !(isPaused && await isPaused(item))) {
+      return { background: withPlaidContext({ userId: item.userId, itemId }, () => Promise.resolve(refreshBalances(item)).catch(() => {})) };
+    }
     return {}; // legacy INITIAL_UPDATE / HISTORICAL_UPDATE / DEFAULT_UPDATE are superseded by sync
   }
 

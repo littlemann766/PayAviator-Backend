@@ -42,7 +42,7 @@ export function itemSummary(i) {
   };
 }
 
-function decorateAccount(a, item) {
+function decorateAccount(a, item, meta = {}) {
   const isCredit = String(a?.type || '').toLowerCase() === 'credit';
   const current = Number(a?.balances?.current);
   const available = Number(a?.balances?.available);
@@ -61,7 +61,8 @@ function decorateAccount(a, item) {
     balance_used: balanceUsed,
     available_credit: availableCredit,
     utilization_percent: utilization,
-    balance_source: 'plaid_accounts_get',
+    balance_source: meta.source || 'plaid_accounts_get',
+    balance_as_of: new Date(meta.asOf || Date.now()).toISOString(),
     item_id: item.itemId,
     institution_id: item.institutionId,
     institution_name: item.institutionName || 'Connected institution',
@@ -112,7 +113,7 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
       return res.status(401).json({ error: 'invalid_webhook' });
     }
     try {
-      const { background } = await handleWebhook(payload, { store, syncItem, log, isPaused: itemIsPaused, notifyReconnect });
+      const { background } = await handleWebhook(payload, { store, syncItem, log, isPaused: itemIsPaused, notifyReconnect, refreshBalances });
       res.json({ received: true });
       background?.catch(e => log.error('webhook background task failed', { item_id: payload.item_id, ...plaidErrorInfo(e) }));
     } catch (e) {
@@ -557,29 +558,101 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     } catch (e) { fail(res, e, 'update complete failed', 'Could not confirm the reconnection.', 'UPDATE_COMPLETE_FAILED'); }
   });
 
-  api.get(['/plaid/accounts', '/plaid/accounts/:userId'], enforceUserMatch, async (req, res) => {
-    try {
-      const items = await pausedAwareItems(req.userId);
-      if (!items.length) return res.json({ accounts: [], items: [], errors: [] });
-      const accounts = [], errors = [];
-      for (const item of items) {
-        if (isPaused(item)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: 'ITEM_PAUSED', message: 'Paused. Resubscribe to Plus to sync this bank.', needs_update: false, paused: true, pause_reason: PAUSE_REASON }); continue; }
-        if (BLOCKED_STATUSES.has(item.status)) { errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: item.errorCode || item.status, message: 'Reconnect this bank to refresh its balance.', needs_update: true }); continue; }
-        try {
-          const d = await plaid.call('accountsGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
-          for (const a of d.accounts) accounts.push(decorateAccount(a, item));
-        } catch (e) {
-          const code = itemErrorCode(e);
-          if (code) { item.status = statusForItemError(code, e?.response?.data?.error_code_reason); item.errorCode = code; await store.setItemStatus(item.itemId, item.status, code); }
-          log.error('accounts get failed', { item_id: item.itemId, ...plaidErrorInfo(e) });
-          errors.push({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', code: code || 'ACCOUNTS_FAILED', message: e?.response?.data?.error_message || 'A fresh balance is temporarily unavailable.', needs_update: Boolean(code && item.status === ITEM_STATUS.LOGIN_REQUIRED) });
+  // ---------- Balances: free accountsGet by default, live accountsBalanceGet ($0.10) only on a capped manual refresh ----------
+  const LB = config.liveBalance || { cooldownSec: 900, itemDailyCap: 3, itemMonthlyCap: 10, userDailyCap: 5, freeUserDailyCap: 0, globalDailyCap: 200 };
+  const liveFresh = b => b && b.source === 'plaid_balance_get' && Date.now() - b.asOf < LB.cooldownSec * 1000;
+  const itemErr = (item, e) => ({ item_id: item.itemId, institution_name: item.institutionName || 'Connected institution', ...e });
+
+  /** Webhook-driven refresh: free accountsGet stored as 'webhook_refresh'; never overwrites a still-fresh live balance. */
+  async function refreshBalances(item) {
+    const cached = (await store.getBalances([item.itemId])).get(item.itemId);
+    if (liveFresh(cached)) return;
+    const d = await plaid.call('accountsGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
+    await store.putBalances(item.itemId, d.accounts, 'webhook_refresh', Date.now());
+  }
+
+  /** wantLive: Set of item ids the caller asked to refresh live (null for a plain GET). Returns the response body + refresh report. */
+  async function loadAccounts(userId, wantLive = null) {
+    const items = await pausedAwareItems(userId);
+    const report = { performed: [], skipped: [] };
+    if (!items.length) return { body: { accounts: [], items: [], errors: [] }, report };
+    let plan = 'free';
+    if (wantLive) plan = (await billingSummary(store, userId, Date.now(), summaryOpts)).plan;
+    const limits = { cooldownSec: LB.cooldownSec, itemDailyCap: LB.itemDailyCap, itemMonthlyCap: LB.itemMonthlyCap, globalDailyCap: LB.globalDailyCap, userCap: plan === 'premium' ? LB.userDailyCap : LB.freeUserDailyCap };
+    const cache = await store.getBalances(items.map(i => i.itemId));
+    const accounts = [], errors = [];
+    const add = (list, item, meta) => { for (const a of list) accounts.push(decorateAccount(a, item, meta)); };
+    for (const item of items) {
+      if (isPaused(item)) { errors.push(itemErr(item, { code: 'ITEM_PAUSED', message: 'Paused. Resubscribe to Plus to sync this bank.', needs_update: false, paused: true, pause_reason: PAUSE_REASON })); continue; }
+      if (BLOCKED_STATUSES.has(item.status)) { errors.push(itemErr(item, { code: item.errorCode || item.status, message: 'Reconnect this bank to refresh its balance.', needs_update: true })); continue; }
+      const cached = cache.get(item.itemId);
+      try {
+        let liveDone = false;
+        if (wantLive?.has(item.itemId)) {
+          const r = await store.reserveLiveCall(userId, item.itemId, plan, limits);
+          if (!r.ok) {
+            report.skipped.push({ item_id: item.itemId, reason: r.reason, ...(r.retryAfterSec ? { retry_after_sec: r.retryAfterSec } : {}) });
+            log.info('live balance denied', { user_id: userId, item_id: item.itemId, reason: r.reason, plan });
+          } else {
+            try {
+              const d = await plaid.call('accountsBalanceGet', { access_token: item.accessToken }, { idempotent: false, ctx: { itemId: item.itemId } });
+              const asOf = Date.now();
+              await store.putBalances(item.itemId, d.accounts, 'plaid_balance_get', asOf);
+              await store.finishLiveCall(r.id, 'success');
+              log.info('live balance call', { user_id: userId, item_id: item.itemId, plan, outcome: 'success' });
+              add(d.accounts, item, { source: 'plaid_balance_get', asOf });
+              report.performed.push({ item_id: item.itemId });
+              liveDone = true;
+            } catch (e) {
+              const code = itemErrorCode(e) || e?.response?.data?.error_code || 'BALANCE_FAILED';
+              await store.finishLiveCall(r.id, 'error', String(code).slice(0, 64)).catch(() => {});
+              log.warn('live balance call', { user_id: userId, item_id: item.itemId, plan, outcome: 'error', ...plaidErrorInfo(e) });
+              report.skipped.push({ item_id: item.itemId, reason: 'live_failed_fallback' });
+              if (itemErrorCode(e)) throw e; // login required etc: handled below like an accountsGet failure
+            }
+          }
         }
+        if (liveDone) continue;
+        if (liveFresh(cached)) { add(cached.accounts, item, { source: cached.source, asOf: cached.asOf }); continue; }
+        const d = await plaid.call('accountsGet', { access_token: item.accessToken }, { ctx: { itemId: item.itemId } });
+        const asOf = Date.now();
+        await store.putBalances(item.itemId, d.accounts, 'plaid_accounts_get', asOf).catch(e => log.warn('balance cache write failed', { item_id: item.itemId, error_message: e.message }));
+        add(d.accounts, item, { source: 'plaid_accounts_get', asOf });
+      } catch (e) {
+        const code = itemErrorCode(e);
+        if (code) { item.status = statusForItemError(code, e?.response?.data?.error_code_reason); item.errorCode = code; await store.setItemStatus(item.itemId, item.status, code); }
+        log.error('accounts get failed', { item_id: item.itemId, ...plaidErrorInfo(e) });
+        if (!code && cached) { add(cached.accounts, item, { source: cached.source, asOf: cached.asOf }); continue; } // transient: last known balance, honest balance_as_of
+        errors.push(itemErr(item, { code: code || 'ACCOUNTS_FAILED', message: e?.response?.data?.error_message || 'A fresh balance is temporarily unavailable.', needs_update: Boolean(code && item.status === ITEM_STATUS.LOGIN_REQUIRED) }));
       }
-      const uniqueAccounts = [...new Map(accounts.map(a => [physicalAccountKey(a, a.institution_name), a])).values()];
-      res.json({ accounts: uniqueAccounts, items: items.map(itemSummary), errors });
-    } catch (e) {
+    }
+    const uniqueAccounts = [...new Map(accounts.map(a => [physicalAccountKey(a, a.institution_name), a])).values()];
+    return { body: { accounts: uniqueAccounts, items: items.map(itemSummary), errors }, report };
+  }
+
+  api.get(['/plaid/accounts', '/plaid/accounts/:userId'], enforceUserMatch, async (req, res) => {
+    try { res.json((await loadAccounts(req.userId)).body); }
+    catch (e) {
       log.error('accounts failed', plaidErrorInfo(e));
       res.status(500).json({ error: 'Could not load accounts.', code: 'ACCOUNTS_FAILED' });
+    }
+  });
+
+  // Manual "Refresh" tap: live balance (billable) for Plus users within the caps; everything else falls back to the free path.
+  // Body (optional): {item_id?: string}; without it every active bank is a candidate (each still limited individually).
+  api.post(['/plaid/accounts/refresh', '/plaid/accounts/:userId/refresh'], enforceUserMatch, async (req, res) => {
+    try {
+      const only = req.body?.item_id ? String(req.body.item_id) : null;
+      const items = await pausedAwareItems(req.userId);
+      const ids = new Set(items.map(i => i.itemId).filter(id => !only || id === only));
+      if (only && !ids.size) return res.status(404).json({ error: 'Unknown bank.', code: 'ITEM_NOT_FOUND' });
+      const { body, report } = await loadAccounts(req.userId, ids);
+      const counts = await store.liveCallCounts(req.userId);
+      const plan = report.skipped.some(s => s.reason === 'plan_not_eligible') ? 'not_eligible' : 'eligible';
+      res.json({ ...body, refresh: { ...report, live_enabled: plan === 'eligible', user_calls_today: counts.userDay, limits: { cooldown_sec: LB.cooldownSec, item_daily: LB.itemDailyCap, item_monthly: LB.itemMonthlyCap, user_daily: LB.userDailyCap } } });
+    } catch (e) {
+      log.error('accounts refresh failed', plaidErrorInfo(e));
+      res.status(500).json({ error: 'Could not refresh balances.', code: 'ACCOUNTS_REFRESH_FAILED' });
     }
   });
 
