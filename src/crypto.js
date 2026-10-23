@@ -29,7 +29,19 @@ export function encryptToken(plaintext, key) {
   return `${TOKEN_PREFIX}${iv.toString('base64')}:${tag.toString('base64')}:${ct.toString('base64')}`;
 }
 
+// `key` may be a single 32-byte key or an array of keys (current key first, then
+// fallback keys such as TOKEN_ENCRYPTION_KEY_OLD during a key rotation). Encryption
+// always uses the current key only.
 export function decryptToken(value, key) {
+  if (Array.isArray(key)) {
+    let lastErr;
+    for (const k of key) {
+      if (!k) continue;
+      try { return decryptToken(value, k); } catch (e) { lastErr = e; }
+    }
+    if (value == null || !isEncrypted(value)) return value;
+    throw lastErr || new Error('No decryption key available');
+  }
   if (value == null) return value;
   // Legacy plaintext rows are tolerated (the boot migration encrypts them).
   if (!isEncrypted(value)) return value;
@@ -43,4 +55,9 @@ export function decryptToken(value, key) {
 
 export function sha256Hex(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+/** True if `value` decrypts with exactly this key (used by the re-encrypt script). */
+export function decryptsWith(value, key) {
+  try { decryptToken(value, key); return true; } catch { return false; }
 }

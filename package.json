@@ -11,6 +11,7 @@
     "start": "node server.js",
     "check": "node --check server.js && for f in src/*.js scripts/*.js; do node --check \"$f\" || exit 1; done",
     "test": "node --test test/*.test.js",
+    "reencrypt:tokens": "node scripts/reencrypt-tokens.js",
     "cleanup:legacy": "node scripts/cleanup-legacy-items.js"
   },
   "dependencies": {

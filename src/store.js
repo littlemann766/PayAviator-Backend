@@ -49,8 +49,9 @@ export function decideLive(c, limits, now) {
 }
 
 export class PgStore {
-  constructor({ url, ssl }, key, { log } = {}) {
+  constructor({ url, ssl }, key, { log, oldKey } = {}) {
     this.key = key;
+    this.decryptKeys = oldKey ? [key, oldKey] : key;
     this.log = log;
     this.kind = 'postgres';
     this.pool = new pg.Pool({ connectionString: stripSslParams(url), ssl, connectionTimeoutMillis: 8000, max: 10 });
@@ -342,12 +343,12 @@ export class PgStore {
 
   async getItems(userId) {
     const r = await this.pool.query('SELECT * FROM plaid_items WHERE user_id=$1 ORDER BY created_at', [userId]);
-    return r.rows.map(x => rowToItem(x, this.key));
+    return r.rows.map(x => rowToItem(x, this.decryptKeys ?? this.key));
   }
 
   async getItemById(itemId) {
     const r = await this.pool.query('SELECT * FROM plaid_items WHERE item_id=$1', [itemId]);
-    return r.rows[0] ? rowToItem(r.rows[0], this.key) : null;
+    return r.rows[0] ? rowToItem(r.rows[0], this.decryptKeys ?? this.key) : null;
   }
 
   /** Single-bank disconnect: deletes the Item, its transactions, exchanged-token hashes and a pending update link for it. */
@@ -628,9 +629,9 @@ export class MemoryStore {
     });
   }
   async getItems(userId) {
-    return [...this.items.values()].filter(x => x.user_id === userId).sort((a, b) => a.created_at - b.created_at).map(x => rowToItem(x, this.key));
+    return [...this.items.values()].filter(x => x.user_id === userId).sort((a, b) => a.created_at - b.created_at).map(x => rowToItem(x, this.decryptKeys ?? this.key));
   }
-  async getItemById(itemId) { const x = this.items.get(itemId); return x ? rowToItem(x, this.key) : null; }
+  async getItemById(itemId) { const x = this.items.get(itemId); return x ? rowToItem(x, this.decryptKeys ?? this.key) : null; }
   async deleteItem(userId, itemId) {
     const x = this.items.get(itemId);
     if (!x || x.user_id !== userId) return;
