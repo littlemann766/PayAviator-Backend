@@ -56,6 +56,12 @@ export function loadConfig(env = process.env) {
     errors.push('TOKEN_ENCRYPTION_KEY is required whenever DATABASE_URL is set (access tokens are encrypted at rest)');
   }
 
+  // Optional decrypt-only fallback used while rotating TOKEN_ENCRYPTION_KEY.
+  let tokenEncryptionKeyOld = null;
+  if (env.TOKEN_ENCRYPTION_KEY_OLD) {
+    try { tokenEncryptionKeyOld = parseEncryptionKey(env.TOKEN_ENCRYPTION_KEY_OLD); } catch (e) { errors.push(`TOKEN_ENCRYPTION_KEY_OLD: ${e.message}`); }
+  }
+
   // --- Database ---
   const databaseUrl = env.DATABASE_URL || '';
   if (isProduction && !databaseUrl) errors.push('DATABASE_URL is required in production (in-memory storage is refused)');
@@ -253,6 +259,7 @@ export function loadConfig(env = process.env) {
       },
       db: databaseUrl ? { url: databaseUrl, ssl } : null,
       tokenEncryptionKey,
+      tokenEncryptionKeyOld,
       auth,
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
       billing,

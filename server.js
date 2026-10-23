@@ -31,7 +31,7 @@ let store;
 let dbReady = false;
 let storageKind = 'memory';
 if (config.db) {
-  const pgStore = new PgStore(config.db, config.tokenEncryptionKey, { log });
+  const pgStore = new PgStore(config.db, config.tokenEncryptionKey, { log, oldKey: config.tokenEncryptionKeyOld });
   try {
     await pgStore.init();
     store = pgStore;

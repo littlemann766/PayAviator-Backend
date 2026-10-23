@@ -55,3 +55,12 @@ test('an item held by a legacy (pre-Firebase) identity moves to the verified use
   assert.equal((await store.getItems('payaviator-local-user')).length, 0);
   assert.equal((await store.getItems(U))[0].accessToken, 'access-new');
 });
+
+test('decryptToken accepts [current, old] keys during rotation', () => {
+  const oldKey = crypto.randomBytes(32), newKey = crypto.randomBytes(32);
+  const encOld = encryptToken('access-sandbox-rot', oldKey);
+  assert.equal(decryptToken(encOld, [newKey, oldKey]), 'access-sandbox-rot');
+  assert.equal(decryptToken(encryptToken('access-sandbox-new', newKey), [newKey, oldKey]), 'access-sandbox-new');
+  assert.throws(() => decryptToken(encOld, [newKey, crypto.randomBytes(32)]));
+  assert.equal(decryptToken('plain', [newKey]), 'plain');
+});

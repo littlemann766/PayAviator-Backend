@@ -31,7 +31,7 @@ const pool = new pg.Pool({ connectionString: stripSslParams(config.db.url), ssl:
 const plaid = instrumentPlaid(createPlaidClient(config.plaid), plaidAuditLog);
 try {
   console.log(`PayAviator legacy item cleanup (plaid_env=${config.plaid.env}, mode=${apply ? 'APPLY' : 'dry-run'})`);
-  const report = await cleanupLegacyItems({ pool, plaid, key: config.tokenEncryptionKey, apply });
+  const report = await cleanupLegacyItems({ pool, plaid, key: config.tokenEncryptionKeyOld ? [config.tokenEncryptionKey, config.tokenEncryptionKeyOld] : config.tokenEncryptionKey, apply });
   console.log(JSON.stringify(report, null, 2));
   if (!apply) console.log('Dry run only. Re-run with --apply to remove these items at Plaid and delete their data.');
   process.exitCode = report.items_failed ? 1 : 0;

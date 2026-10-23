@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { encryptToken, decryptToken, isEncrypted, TOKEN_PREFIX } from './crypto.js';
 import { ITEM_STATUS } from './plaid.js';
 import { isLegacyUserId } from './legacy.js';
+import { reencryptTokens } from './keyRotation.js';
 import { applyPush, publicItem, SYNC_LIMITS } from './cloudSync.js';
 
 const rowToSync = x => ({ kind: x.kind, id: x.id, data: x.data, deleted: Boolean(x.deleted), updatedAt: Number(x.updated_at), seq: Number(x.seq) });
@@ -49,8 +50,10 @@ export function decideLive(c, limits, now) {
 }
 
 export class PgStore {
-  constructor({ url, ssl }, key, { log } = {}) {
+  constructor({ url, ssl }, key, { log, oldKey } = {}) {
     this.key = key;
+    this.oldKey = oldKey || null;
+    this.decryptKeys = oldKey ? [key, oldKey] : key;
     this.log = log;
     this.kind = 'postgres';
     this.pool = new pg.Pool({ connectionString: stripSslParams(url), ssl, connectionTimeoutMillis: 8000, max: 10 });
@@ -133,6 +136,7 @@ export class PgStore {
     await q('CREATE INDEX IF NOT EXISTS live_balance_calls_time_idx ON live_balance_calls(called_at)');
 
     await this.encryptLegacyTokens();
+    await this.rotateTokenKey();
   }
 
   async getBalances(itemIds) {
@@ -303,6 +307,19 @@ export class PgStore {
     return r.rows.map(rowToEnt);
   }
 
+  /**
+   * Boot-time key check / rotation. With TOKEN_ENCRYPTION_KEY_OLD set, re-encrypts rows still on the old
+   * key (single transaction, verified, rolled back on any failure; reads keep working via the fallback).
+   * Without it, only reports how many rows fail to decrypt with the current key. Never fatal.
+   */
+  async rotateTokenKey() {
+    try {
+      const r = await reencryptTokens(this.pool, this.key, this.oldKey || null, { apply: Boolean(this.oldKey) });
+      (r.result === 'rolled_back' || r.undecryptable ? this.log?.error : this.log?.info)?.call(this.log, 'token_key_check', r);
+      return r;
+    } catch (e) { this.log?.error?.('token_key_check_failed', { message: e.message }); return null; }
+  }
+
   /** One-time, idempotent: encrypt any access_token not yet carrying the enc:v1: prefix. */
   async encryptLegacyTokens() {
     const client = await this.pool.connect();
@@ -342,12 +359,12 @@ export class PgStore {
 
   async getItems(userId) {
     const r = await this.pool.query('SELECT * FROM plaid_items WHERE user_id=$1 ORDER BY created_at', [userId]);
-    return r.rows.map(x => rowToItem(x, this.key));
+    return r.rows.map(x => rowToItem(x, this.decryptKeys ?? this.key));
   }
 
   async getItemById(itemId) {
     const r = await this.pool.query('SELECT * FROM plaid_items WHERE item_id=$1', [itemId]);
-    return r.rows[0] ? rowToItem(r.rows[0], this.key) : null;
+    return r.rows[0] ? rowToItem(r.rows[0], this.decryptKeys ?? this.key) : null;
   }
 
   /** Single-bank disconnect: deletes the Item, its transactions, exchanged-token hashes and a pending update link for it. */
@@ -628,9 +645,9 @@ export class MemoryStore {
     });
   }
   async getItems(userId) {
-    return [...this.items.values()].filter(x => x.user_id === userId).sort((a, b) => a.created_at - b.created_at).map(x => rowToItem(x, this.key));
+    return [...this.items.values()].filter(x => x.user_id === userId).sort((a, b) => a.created_at - b.created_at).map(x => rowToItem(x, this.decryptKeys ?? this.key));
   }
-  async getItemById(itemId) { const x = this.items.get(itemId); return x ? rowToItem(x, this.key) : null; }
+  async getItemById(itemId) { const x = this.items.get(itemId); return x ? rowToItem(x, this.decryptKeys ?? this.key) : null; }
   async deleteItem(userId, itemId) {
     const x = this.items.get(itemId);
     if (!x || x.user_id !== userId) return;
