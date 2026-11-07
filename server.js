@@ -12,6 +12,7 @@ import { createMessagingClient, createReconnectNotifier } from './src/push.js';
 import { createIntegrityClient } from './src/integrity.js';
 import { createStripeClient } from './src/stripeBilling.js';
 import { createGooglePlayClient, createPubSubVerifier } from './src/billing.js';
+import { createAccountLookup } from './src/accountLookup.js';
 
 let config, warnings;
 try {
@@ -84,6 +85,13 @@ if (!googlePlay) log.warn('billing_not_configured: /api/billing/google-play/* re
 const stripe = config.stripe.configured ? createStripeClient(config.stripe.secretKey) : null;
 if (!stripe) log.warn('stripe_not_configured: /api/billing/stripe/* return 503');
 
+let accountLookup = null;
+if (config.accountLookup?.configured) {
+  try { accountLookup = await createAccountLookup(config.accountLookup); }
+  catch (e) { log.error('account lookup init failed; deleted-account purchase transfer stays off', { error_message: e.message }); }
+}
+if (!accountLookup) log.warn('account_lookup_not_configured: a Play purchase stored for another uid is not transferred');
+
 let messaging = null;
 try { messaging = await createMessagingClient(config.push); }
 catch (e) { log.error('fcm init failed; bank-reconnect pushes disabled', { error_message: e.message }); }
@@ -91,8 +99,8 @@ if (messaging) log.info('fcm push ready', { project_id: config.push.projectId, c
 const notifyReconnect = messaging ? createReconnectNotifier({ store, messaging, log, dedupeMs: config.push.dedupeHours * 3600 * 1000 }) : null;
 
 const app = createApp({
-  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity, stripe, notifyReconnect,
-  health: () => ({ storage: storageKind, databaseReady: dbReady, pushConfigured: Boolean(messaging) }),
+  config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, googlePlay, pubsubVerifier, integrity, stripe, notifyReconnect, accountLookup,
+  health: () => ({ storage: storageKind, databaseReady: dbReady, pushConfigured: Boolean(messaging), accountLookupConfigured: Boolean(accountLookup) }),
 });
 
 const server = app.listen(config.port, '0.0.0.0', () => {

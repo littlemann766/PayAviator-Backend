@@ -113,6 +113,14 @@ export class PgStore {
       user_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ DEFAULT NOW())`);
     await q(`CREATE TABLE IF NOT EXISTS stripe_events (
       event_id TEXT PRIMARY KEY, type TEXT NOT NULL, processed_at TIMESTAMPTZ DEFAULT NOW())`);
+    // Per-uid Play restore hold. No purchase token, receipt, or other user's id.
+    await q(`CREATE TABLE IF NOT EXISTS billing_recovery_holds (
+      user_id TEXT PRIMARY KEY, code TEXT NOT NULL, duplicate_checkout_blocked BOOLEAN NOT NULL DEFAULT TRUE,
+      token_hash TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())`);
+    await q('ALTER TABLE billing_recovery_holds ADD COLUMN IF NOT EXISTS token_hash TEXT');
+    // Last Stripe Checkout Session id we created for this uid, so a retry reuses an open session.
+    await q(`CREATE TABLE IF NOT EXISTS stripe_checkout_sessions (
+      user_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())`);
 
     // Cloud sync: per-user items (bills, income, ...). Tombstones (deleted=true) keep data '{}' and are purged after 90 days.
     await q(`CREATE TABLE IF NOT EXISTS sync_items (
@@ -301,6 +309,85 @@ export class PgStore {
   async getEntitlements(userId) {
     const r = await this.pool.query('SELECT * FROM billing_entitlements WHERE user_id=$1', [userId]);
     return r.rows.map(rowToEnt);
+  }
+
+  /**
+   * Inserts or updates one Play entitlement under a row lock.
+   * mode `same` refuses to change user_id. mode `reassign` changes user_id only when it is still `fromUserId`
+   * (or already `userId`, for a retry). Supersede marks linked tokens SUPERSEDED only when their user_id still matches.
+   */
+  async applyPlayClaim(op) {
+    const supersede = (op.supersede || []).filter(s => s?.tokenHash && s.tokenHash !== op.tokenHash);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const keys = [op.tokenHash, ...supersede.map(s => s.tokenHash)].sort();
+      for (const key of keys) await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`ent:${key}`]);
+      const cur = await client.query('SELECT * FROM billing_entitlements WHERE purchase_token_hash=$1 FOR UPDATE', [op.tokenHash]);
+      const row = cur.rows[0] ? rowToEnt(cur.rows[0]) : null;
+      if (op.mode === 'reassign') {
+        if (!row) { await client.query('ROLLBACK'); return { ok: false, reason: 'missing' }; }
+        if (row.userId !== op.userId && row.userId !== op.fromUserId) {
+          await client.query('ROLLBACK');
+          return { ok: false, reason: 'conflict', ownerUserId: row.userId };
+        }
+      } else if (row && row.userId !== op.userId) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'conflict', ownerUserId: row.userId };
+      }
+      await client.query(
+        `INSERT INTO billing_entitlements(purchase_token_hash,user_id,product_id,platform,state,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6)
+         ON CONFLICT(purchase_token_hash) DO UPDATE SET user_id=EXCLUDED.user_id, product_id=EXCLUDED.product_id,
+           platform=EXCLUDED.platform, state=EXCLUDED.state, expires_at=EXCLUDED.expires_at, updated_at=NOW()`,
+        [op.tokenHash, op.userId, op.productId, op.platform || 'google_play', op.state, op.expiresAt || null]);
+      for (const s of supersede) {
+        await client.query(
+          `UPDATE billing_entitlements SET state='SUPERSEDED', updated_at=NOW()
+           WHERE purchase_token_hash=$1 AND user_id=$2`, [s.tokenHash, s.userId]);
+      }
+      await client.query('COMMIT');
+      return { ok: true, entitlement: { tokenHash: op.tokenHash, userId: op.userId, productId: op.productId, platform: op.platform || 'google_play', state: op.state, expiresAt: op.expiresAt || null } };
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { client.release(); }
+  }
+
+  async getRecoveryHold(userId) {
+    const r = await this.pool.query('SELECT code, duplicate_checkout_blocked, token_hash FROM billing_recovery_holds WHERE user_id=$1', [userId]);
+    return r.rows[0] ? { code: r.rows[0].code, duplicateCheckoutBlocked: Boolean(r.rows[0].duplicate_checkout_blocked), tokenHash: r.rows[0].token_hash || null } : null;
+  }
+  async putRecoveryHold(userId, { code, duplicateCheckoutBlocked, tokenHash = null }) {
+    await this.pool.query(`INSERT INTO billing_recovery_holds(user_id,code,duplicate_checkout_blocked,token_hash) VALUES($1,$2,$3,$4)
+      ON CONFLICT(user_id) DO UPDATE SET code=EXCLUDED.code, duplicate_checkout_blocked=EXCLUDED.duplicate_checkout_blocked,
+        token_hash=EXCLUDED.token_hash, updated_at=NOW()`,
+    [userId, code, Boolean(duplicateCheckoutBlocked), tokenHash]);
+  }
+  async clearRecoveryHold(userId) {
+    await this.pool.query('DELETE FROM billing_recovery_holds WHERE user_id=$1', [userId]);
+  }
+  async getCheckoutSession(userId) {
+    const r = await this.pool.query('SELECT session_id FROM stripe_checkout_sessions WHERE user_id=$1', [userId]);
+    return r.rows[0]?.session_id || null;
+  }
+  async putCheckoutSession(userId, sessionId) {
+    await this.pool.query(`INSERT INTO stripe_checkout_sessions(user_id,session_id) VALUES($1,$2)
+      ON CONFLICT(user_id) DO UPDATE SET session_id=EXCLUDED.session_id, updated_at=NOW()`, [userId, sessionId]);
+  }
+  /** Serialises checkout creation for one uid across processes. The callback may call Stripe. */
+  async withBillingLock(userId, fn) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`billing:${userId}`]);
+      const result = await fn();
+      await client.query('COMMIT');
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { client.release(); }
   }
 
   /** One-time, idempotent: encrypt any access_token not yet carrying the enc:v1: prefix. */
@@ -544,6 +631,9 @@ export class MemoryStore {
     this.entitlements = new Map(); // tokenHash -> entitlement
     this.stripeCustomers = new Map(); // userId -> customerId
     this.stripeEvents = new Map(); // eventId -> {type, at}
+    this.recoveryHolds = new Map(); // userId -> {code, duplicateCheckoutBlocked}
+    this.checkoutSessions = new Map(); // userId -> sessionId
+    this._tails = new Map();
     this.claims = new Map(); // `${kind}|${hash}|${userId}` -> {kind,hash,userId,itemId,releasedAt}
     this.syncRows = new Map(); // `${userId}|${kind}|${id}` -> {userId,kind,id,data,updatedAt,deleted,seq}
     this.syncSeq = 0;
@@ -616,6 +706,50 @@ export class MemoryStore {
   async purgeStripeEvents(days = 30, now = Date.now()) { let n = 0; for (const [k, v] of this.stripeEvents) if (v.at < now - days * 86400e3) { this.stripeEvents.delete(k); n++; } return n; }
   async getEntitlementByTokenHash(h) { const e = this.entitlements.get(h); return e ? { ...e } : null; }
   async getEntitlements(userId) { return [...this.entitlements.values()].filter(e => e.userId === userId).map(e => ({ ...e })); }
+  _acquire(key) {
+    let release;
+    const gate = new Promise(res => { release = () => res(); });
+    const prev = this._tails.get(key) || Promise.resolve();
+    this._tails.set(key, prev.then(() => gate));
+    return prev.then(() => release);
+  }
+  async withLocks(keys, fn) {
+    const uniq = [...new Set(keys)].sort();
+    const releases = [];
+    for (const key of uniq) releases.push(await this._acquire(key));
+    try { return await fn(); }
+    finally { for (const release of releases.reverse()) release(); }
+  }
+  async applyPlayClaim(op) {
+    const supersede = (op.supersede || []).filter(s => s?.tokenHash && s.tokenHash !== op.tokenHash);
+    return this.withLocks([op.tokenHash, ...supersede.map(s => s.tokenHash)], async () => {
+      const prev = this.entitlements.get(op.tokenHash);
+      if (op.mode === 'reassign') {
+        if (!prev) return { ok: false, reason: 'missing' };
+        if (prev.userId !== op.userId && prev.userId !== op.fromUserId) return { ok: false, reason: 'conflict', ownerUserId: prev.userId };
+      } else if (prev && prev.userId !== op.userId) {
+        return { ok: false, reason: 'conflict', ownerUserId: prev.userId };
+      }
+      const next = {
+        tokenHash: op.tokenHash, userId: op.userId, productId: op.productId,
+        platform: op.platform || prev?.platform || 'google_play', state: op.state, expiresAt: op.expiresAt || null,
+      };
+      this.entitlements.set(op.tokenHash, next);
+      for (const s of supersede) {
+        const old = this.entitlements.get(s.tokenHash);
+        if (old && old.userId === s.userId) this.entitlements.set(s.tokenHash, { ...old, state: 'SUPERSEDED' });
+      }
+      return { ok: true, entitlement: { ...next } };
+    });
+  }
+  async getRecoveryHold(userId) { const h = this.recoveryHolds.get(userId); return h ? { ...h } : null; }
+  async putRecoveryHold(userId, { code, duplicateCheckoutBlocked, tokenHash = null }) {
+    this.recoveryHolds.set(userId, { code, duplicateCheckoutBlocked: Boolean(duplicateCheckoutBlocked), tokenHash });
+  }
+  async clearRecoveryHold(userId) { this.recoveryHolds.delete(userId); }
+  async getCheckoutSession(userId) { return this.checkoutSessions.get(userId) || null; }
+  async putCheckoutSession(userId, sessionId) { this.checkoutSessions.set(userId, sessionId); }
+  async withBillingLock(userId, fn) { return this.withLocks([`billing:${userId}`], fn); }
   async init() {}
   async putItem(x) {
     const existing = this.items.get(x.itemId);

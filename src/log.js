@@ -12,6 +12,11 @@ const REDACTIONS = [
   [/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g, '[REDACTED_JWT]'],
   // FCM registration tokens (<instance id>:APA91...).
   [/\b[A-Za-z0-9_-]{8,}:APA91[A-Za-z0-9_-]+/g, '[REDACTED_FCM_TOKEN]'],
+  // Play purchase-token URLs and Stripe secrets. Call sites also scrub the raw token before logging.
+  [/subscriptionsv2\/tokens\/[^/?\s"']+/g, 'subscriptionsv2/tokens/[REDACTED]'],
+  [/\/tokens\/[^/?\s"']{8,}/g, '/tokens/[REDACTED]'],
+  [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]+/g, '[REDACTED_STRIPE_KEY]'],
+  [/\bwhsec_[A-Za-z0-9]+/g, 'whsec_[REDACTED]'],
   // Emails. Bounded, non-overlapping character classes: no catastrophic backtracking.
   [/[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,8}/g, '[REDACTED_EMAIL]'],
 ];
@@ -22,7 +27,8 @@ const BLOCKED_KEYS = new Set(['access_token', 'accessToken', 'public_token', 'li
   // PII / financial values / Firebase credentials (Plaid production checklist logging rules).
   'balance', 'current', 'available', 'limit', 'amount', 'name', 'official_name', 'merchant_name', 'owners',
   'email', 'emails', 'phone', 'phone_numbers', 'address', 'addresses', 'id_token', 'idToken', 'token',
-  'firebase_token', 'refresh_token', 'purchase_token', 'purchaseToken', 'integrity_token', 'password',
+  'firebase_token', 'refresh_token', 'purchase_token', 'purchaseToken', 'linkedPurchaseToken', 'integrity_token', 'password',
+  'private_key', 'client_secret', 'webhook_secret', 'session_id', 'checkout_session',
   'Authorization', 'cookie', 'fcm_token', 'fcmToken', 'tokens', 'registration_token', 'registration_ids', 'processor_token', 'link_session', 'results', 'on_success', 'metadata']);
 
 export function redact(value, depth = 0) {

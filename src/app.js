@@ -12,6 +12,7 @@ import { accountFingerprints, deviceFingerprint, readDeviceId, gateError } from 
 import { checkVerdict } from './integrity.js';
 import { stripeRoutes, stripeWebhookRoute } from './stripeBilling.js';
 import { FREE_BANK_LIMIT, PAUSE_REASON, billingSummary, entitlementFromPurchase, isEntitlementActive, applyPause, isPaused } from './billing.js';
+import { handleGooglePlayVerify, recoveryFlags, scrubBillingMessage } from './billingRecovery.js';
 import { SYNC_LIMITS } from './cloudSync.js';
 import { isValidFcmToken, PLATFORMS } from './push.js';
 
@@ -70,7 +71,7 @@ function decorateAccount(a, item, meta = {}) {
   };
 }
 
-export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null, stripe = null, notifyReconnect = null }) {
+export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier, syncItem, log, health = () => ({}), googlePlay = null, pubsubVerifier = null, integrity = null, stripe = null, notifyReconnect = null, accountLookup = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -182,8 +183,11 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   billing.get('/status', async (req, res) => {
     try {
-      const s = await billingSummary(store, req.userId, Date.now(), summaryOpts);
-      res.json({ ...s, billingConfigured: billingReady(), stripeConfigured: Boolean(config.stripe?.configured && stripe) });
+      const now = Date.now();
+      const s = await billingSummary(store, req.userId, now, summaryOpts);
+      const [hold, entitlements] = await Promise.all([store.getRecoveryHold(req.userId), store.getEntitlements(req.userId)]);
+      const flags = recoveryFlags({ hold, entitlements, plan: s.plan, now });
+      res.json({ ...s, ...flags, billingConfigured: billingReady(), stripeConfigured: Boolean(config.stripe?.configured && stripe) });
     } catch (e) {
       log.error('billing status failed', { error_message: e.message });
       res.status(500).json({ error: 'Could not load plan.', code: 'BILLING_STATUS_FAILED' });
@@ -192,28 +196,14 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
 
   billing.post('/google-play/verify', async (req, res) => {
     if (!billingReady()) return notConfigured(res);
-    const productId = typeof req.body?.productId === 'string' ? req.body.productId.trim() : '';
-    const purchaseToken = typeof req.body?.purchaseToken === 'string' ? req.body.purchaseToken.trim() : '';
-    if (!productId || !purchaseToken || purchaseToken.length > 4096 || productId.length > 200) return res.status(400).json({ error: 'missing_purchase', code: 'MISSING_PURCHASE' });
-    if (config.billing.productIds.length && !config.billing.productIds.includes(productId)) return res.status(400).json({ error: 'unknown_product', code: 'UNKNOWN_PRODUCT' });
     try {
-      const owner = await store.getEntitlementByTokenHash(sha256Hex(purchaseToken));
-      if (owner && owner.userId !== req.userId) return res.status(409).json({ error: 'purchase_in_use', code: 'PURCHASE_IN_USE' });
-      const ent = await refreshPurchase({ userId: req.userId, productId, purchaseToken });
-      if (!ent.productMatches) return res.status(400).json({ error: 'product_mismatch', code: 'PRODUCT_MISMATCH' });
-      const active = isEntitlementActive(ent);
-      if (active && !ent.acknowledged) {
-        // Google refunds unacknowledged purchases after 3 days; failure here is retried on the next verify.
-        try { await googlePlay.acknowledge(productId, purchaseToken); } catch (e) { log.error('purchase acknowledge failed', { error_message: e.message }); }
-      }
-      res.status(active ? 200 : 402).json({
-        ...(active ? {} : { error: 'subscription_inactive', code: 'SUBSCRIPTION_INACTIVE' }),
-        ...(await billingSummary(store, req.userId, Date.now(), summaryOpts)), subscriptionState: ent.state,
+      const out = await handleGooglePlayVerify({
+        userId: req.userId, body: req.body, config, store, googlePlay, accountLookup, log,
+        summary: uid => billingSummary(store, uid, Date.now(), summaryOpts),
       });
+      res.status(out.status).json(out.body);
     } catch (e) {
-      const st = e?.response?.status || e?.status;
-      if (st === 400 || st === 404 || st === 410) return res.status(400).json({ error: 'invalid_purchase', code: 'INVALID_PURCHASE' });
-      log.error('google play verify failed', { status: st, error_message: e.message });
+      log.error('google play verify failed', { error_message: scrubBillingMessage(e?.message) });
       res.status(502).json({ error: 'verify_failed', code: 'VERIFY_FAILED' });
     }
   });
@@ -685,9 +675,10 @@ export function createApp({ config, store, plaid, tokenVerifier, webhookVerifier
     }
   });
 
-  // Account deletion: removes every Item at Plaid, then deletes all of the user's stored data
-  // (items, transactions, pending links, exchanged-token rows) in one DB transaction.
-  // Items whose /item/remove failed are kept (with their rows) so the call can be retried.
+  // Account deletion: removes every Item at Plaid, then deletes the user's stored bank/sync/device data.
+  // No reason or survey is required, and this does not cancel Google Play or Stripe. Billing rows
+  // (entitlements, Stripe customer id, recovery holds) stay so a still-signed-in user can open the
+  // portal, and so a deleted Auth user can be restored only by the Play proof path. Bank links are not restored.
   api.delete('/plaid/user', async (req, res) => {
     try {
       const items = await store.getItems(req.userId);

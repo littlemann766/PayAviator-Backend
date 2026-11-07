@@ -53,7 +53,9 @@ fingerprints. They're deleted 30 days after you remove the bank or delete your a
 | Data | Kept while | Deleted |
 |---|---|---|
 | Bank/device fingerprints (HMAC) for a linked free bank | bank linked (incl. Plaid-revoked items kept for "Reconnect") | 30 days after the bank is removed or the account data is deleted (`FREE_TIER_COOLDOWN_DAYS`) |
-| Stripe customer id <-> sign-in id | while the account exists | not yet auto-deleted (needed for the billing portal); TODO on account deletion |
+| Stripe customer id <-> sign-in id | while that sign-in id is the one our server stored | not moved to a new sign-in by email. Account-data deletion does not remove it (the portal still needs it for that uid). A new Firebase uid does not inherit it |
+| Stripe Checkout session id for the signed-in user (retry the same open checkout) | until a newer checkout replaces it | replaced on the next session this uid starts; not a card number |
+| Billing recovery hold (sign-in id, reason code, sha256 of the Play token) | until that same purchase is resolved or this uid successfully verifies their own subscription | no raw token, no other person's id |
 | Stripe webhook event ids (no payment data) | 30 days | hourly purge |
-| Subscription entitlement (store, plan id, state, expiry; Play token only as sha256) | while the account exists | — |
+| Subscription entitlement (store, plan id, state, expiry; Play token only as sha256) | moved to a new sign-in only when Play verifies the token and Firebase Auth says the stored uid is gone | not deleted just because bank data is deleted. Not a copy of the receipt |
 No card numbers or payment details are ever received; Stripe Checkout handles them.
