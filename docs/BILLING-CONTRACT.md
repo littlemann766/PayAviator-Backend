@@ -84,3 +84,71 @@ https://<backend>/api/billing/stripe/webhook with the events above, enable the c
 - Future work (not built): phone-only sign-in. Server still requires a verified email for bank linking; phone-only accounts need that check changed.
 
 - Stripe Checkout is cards only (`payment_method_types:['card']`). New Stripe customers get `customer_email` prefilled from the Firebase token's `email` claim; returning customers reuse their stored Stripe customer.
+
+## Subscription restore and duplicate checkout (2026-11-07)
+
+This does **not** claim the billing system is fully secure or compliant. It closes one gap: a deleted Firebase Auth user left `billing_entitlements` and `stripe_customers` behind, so a new uid could not restore a Play purchase (`409 purchase_in_use`) and could start a second subscription while the old one still renewed.
+
+### What the app sends (unchanged request)
+
+`POST /api/billing/google-play/verify` body is still only:
+
+```json
+{ "productId": "string", "purchaseToken": "string" }
+```
+
+Email, `customer` / `customerId`, `obfuscatedExternalAccountId`, and any purchase JSON in the body are **ignored**. The server accepts the purchase only after `purchases.subscriptionsv2.get` succeeds. Play's `externalAccountIdentifiers` are read from that response, not from the phone.
+
+`POST /api/billing/stripe/checkout` body is still `{ "plan": "monthly"|"yearly" }`. A customer id or email in the body is ignored. `POST /api/billing/stripe/portal` is still an empty body; the customer id is loaded from the signed-in uid only. There is no email search and no client-supplied customer id.
+
+`DELETE /api/plaid/user` still takes no reason and no survey. It does **not** cancel Play or Stripe, and it does **not** delete entitlement rows or the Stripe customer id. It also does not restore or relink banks later.
+
+### Verify responses the app should branch on
+
+| Situation | HTTP | Body |
+|---|---|---|
+| This uid already owns the token, or Play has no stored owner, and the sub is entitled (active, grace, or canceled-but-unexpired) | 200 | Existing status fields, plus `subscriptionState`, `recoveryRequired:false`, `duplicateCheckoutBlocked` (true while Plus is on). `recovered` is omitted. |
+| Same, but the sub is not entitled | 402 | `error:"subscription_inactive"`, `code:"SUBSCRIPTION_INACTIVE"`, status fields, `subscriptionState`, and the two booleans. |
+| Stored owner **still exists** in Firebase Auth (including disabled) | 409 | Exactly `{ "error":"purchase_in_use", "code":"PURCHASE_IN_USE" }`. Nothing is moved. Checkout is not blocked for this reason. |
+| Stored owner is **auth/user-not-found**, Play confirms a sub that can still bill, and Play did not name some other account id | 200 or 402 | Same as a normal verify for this uid, plus `"recovered": true`. Only the entitlement row moves. Banks are not restored. |
+| Auth lookup is not configured, errors, or Play's account id is neither this uid nor the stored owner, and the sub can still bill | 409 | `purchase_in_use` / `PURCHASE_IN_USE` plus `recoveryRequired:true`, `duplicateCheckoutBlocked:true`, `recoveryCode:"OWNERSHIP_UNCONFIRMED"`. Nothing is moved. |
+| Play HTTP 400/404/410, product mismatch, unknown product, missing token | 400 | Unchanged codes. Nothing is moved. |
+| Play otherwise fails | 502 | `verify_failed`. Nothing is moved. No entitlement is created. |
+| Billing not configured | 503 | `billing_not_configured`. |
+
+`GET /api/billing/status` adds two booleans and does not remove old fields:
+
+- `recoveryRequired` — this sign-in presented a Play purchase the server could not safely move, and that purchase can still bill. Not a promise that support can restore it automatically.
+- `duplicateCheckoutBlocked` — do not start another Stripe Checkout. True when `plan` is not `free`, when a stored sub can still resume (`PAUSED`, `ON_HOLD`, `PENDING`), or when `recoveryRequired` is true.
+
+Show `OWNERSHIP_UNCONFIRMED` as "we could not safely move this subscription; it was not moved; don't buy again while it may still renew." Do not tell the person that another named account has it unless the body is the exact two-field `purchase_in_use` object (that one means Auth still has the stored owner). Never display the other uid; the API does not return it.
+
+### Checkout responses
+
+- `409 already_premium` — this uid is already Plus (local entitlement or a Stripe subscription just read for this uid). Unchanged `source`.
+- `409 duplicate_checkout_blocked` / `DUPLICATE_CHECKOUT_BLOCKED` — `{ duplicateCheckoutBlocked:true, recoveryRequired:boolean, source?: "play"|"stripe" }`. No Checkout Session is created.
+- `502 checkout_failed` — Stripe list/retrieve failed. No second session is created and nothing is granted.
+- `200 {url,id}` — new session, or the same open session this uid already started (idempotent retry).
+- `404 no_stripe_customer` on the portal — this uid has no stored customer. A matching email is not used to find one.
+
+### Security assumptions (not a compliance claim)
+
+- A Play purchase token is not proof by itself. Reassignment also needs Firebase Admin `getUser(storedUid)` to return `auth/user-not-found`. Any other error, including `auth/insufficient-permission` and timeouts, does not move the row.
+- `auth/user-not-found` is also what Auth returns for a uid that was never in this project. Entitlement rows are created only for a uid that was signed in at verify time. Disabled users still exist and block transfer.
+- The lookup uses `FIREBASE_SERVICE_ACCOUNT_JSON` and `FIREBASE_PROJECT_ID` (the FCM credential). It is not the Play Console service account. If it is missing, transfer stays off.
+- Email, Subscribe with Google email, a bearer ID token, a client purchase blob, and a client Stripe customer id are not proofs. Stripe customers are not searched or moved across uids.
+- If Play returns `obfuscatedExternalAccountId` or `externalAccountId`, it must equal this uid or the stored owner (exact string). The current app does not set that field. A hash we cannot read fails closed (`OWNERSHIP_UNCONFIRMED`) instead of being treated as a match.
+- A living stored owner is never overwritten, including when a replacement token's `linkedPurchaseToken` still belongs to them.
+- Two concurrent restores lock the token hash. One successor wins; the other gets `409 purchase_in_use`.
+- Refunded / expired / revoked (`EXPIRED`, `PENDING_PURCHASE_CANCELED`, or any state that cannot still bill) are not moved and do not block a new checkout. Paused, on hold, and pending are moved when the owner is gone but do **not** grant Plus until Play reports an entitled state.
+- Acknowledgement runs only after a grant. Provider failures are not acknowledged and not stored.
+- Logs must not contain the raw purchase token. The server scrubs token strings and Play token URLs. Recovery holds store a sha256 and a code, not the token and not the other uid.
+
+### Limits that remain
+
+- Orphaned **Stripe** subscriptions are not automatically attached to a new uid. Someone who deletes Auth and makes a new account can still be charged by the old Stripe customer until that subscription is cancelled in Stripe. The server will not look the customer up by email. Portal access requires the original uid's stored customer id, which a new uid does not have.
+- A person who has the Play token after the original Auth user is gone can receive that Play entitlement. That is the accepted restore rule, not a proof of legal identity.
+- Checkout is blocked only when this uid's own rows, a recovery hold, or Stripe's API for **this uid's stored customer** show a subscription that may still bill. A brand-new uid with no Play token and no Stripe customer is not matched to an orphan.
+- Bank connections, transactions, and Plaid items are not restored and bank links are not reopened.
+- Package `app.payaviator` and product `payaviator_premium` are backend test fixtures. The Android applicationId in the app review is `com.payaviator.app`. This change does not set production package, product, or provider keys.
+- Cancellation stays in Google Play (package `com.payaviator.app`, sku from `status.productId` when it is a Play product id) or the Stripe portal for the signed-in uid. Deleting the account is separate and does not ask why.

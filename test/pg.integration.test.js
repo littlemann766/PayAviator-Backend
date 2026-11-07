@@ -243,3 +243,31 @@ test('PgStore: FCM tokens (upsert, cap, reassign, delete) and push dedupe', { sk
   assert.equal((await raw.query(`SELECT count(*)::int n FROM push_dedupe WHERE item_id='pi'`)).rows[0].n, 0);
   await store.close(); await raw.end();
 });
+
+test('PgStore: play claim reassignment is conditional and holds store only a hash', { skip: !url && 'TEST_DATABASE_URL not set' }, async () => {
+  const raw = new pg.Pool({ connectionString: url });
+  await raw.query('DROP TABLE IF EXISTS billing_entitlements, billing_recovery_holds, stripe_checkout_sessions');
+  const store = new PgStore({ url, ssl: false }, crypto.randomBytes(32));
+  await store.init();
+  const exp = new Date(Date.now() + 86400e3).toISOString();
+  await store.putEntitlement({ tokenHash: 'th', userId: 'old', productId: 'p', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: exp });
+  const lost = await store.applyPlayClaim({ mode: 'reassign', tokenHash: 'th', userId: 'new', fromUserId: 'someone-else', productId: 'p', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: exp, platform: 'google_play' });
+  assert.equal(lost.ok, false);
+  assert.equal(lost.ownerUserId, 'old');
+  const won = await store.applyPlayClaim({ mode: 'reassign', tokenHash: 'th', userId: 'new', fromUserId: 'old', productId: 'p', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: exp, platform: 'google_play', supersede: [] });
+  assert.equal(won.ok, true);
+  assert.equal((await store.getEntitlementByTokenHash('th')).userId, 'new');
+  const again = await store.applyPlayClaim({ mode: 'same', tokenHash: 'th', userId: 'intruder', fromUserId: 'intruder', productId: 'p', state: 'SUBSCRIPTION_STATE_ACTIVE', expiresAt: exp, platform: 'google_play' });
+  assert.equal(again.ok, false);
+  assert.equal((await store.getEntitlementByTokenHash('th')).userId, 'new');
+  await store.putRecoveryHold('new', { code: 'OWNERSHIP_UNCONFIRMED', duplicateCheckoutBlocked: true, tokenHash: 'abc123hash' });
+  const hold = await store.getRecoveryHold('new');
+  assert.equal(hold.tokenHash, 'abc123hash');
+  assert.equal(JSON.stringify(hold).includes('raw-purchase-token'), false);
+  await store.putCheckoutSession('new', 'cs_test');
+  assert.equal(await store.getCheckoutSession('new'), 'cs_test');
+  await store.deleteUserData('new');
+  assert.equal((await store.getEntitlementByTokenHash('th')).userId, 'new');
+  assert.equal((await store.getRecoveryHold('new')).code, 'OWNERSHIP_UNCONFIRMED');
+  await store.close(); await raw.end();
+});

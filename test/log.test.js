@@ -10,8 +10,10 @@ test('log redaction strips tokens, JWTs, encrypted values and payload fields', (
     access_token: 'anything', transactions: [{ amount: 12.5, name: 'Coffee' }], payload: { x: 1 },
     nested: { link_token: 'link-sandbox-zzz' },
     user_id: 'AbCdEfGhIjKlMnOpQrStUvWxYz12', item_id: 'item-1', request_id: 'req-1',
+    error_message: 'GET /tokens/super-secret-purchase-token failed sk_live_abc123 whsec_zzz',
+    purchaseToken: 'super-secret-purchase-token',
   }));
-  for (const leaked of ['1234abcd', 'aaaa-bbbb', 'eyJhbGci', 'aaa:bbb', 'anything', 'Coffee', 'zzz']) assert.ok(!out.includes(leaked), `leaked ${leaked}`);
+  for (const leaked of ['1234abcd', 'aaaa-bbbb', 'eyJhbGci', 'aaa:bbb', 'anything', 'Coffee', 'zzz', 'super-secret-purchase-token', 'sk_live_abc123', 'whsec_zzz']) assert.ok(!out.includes(leaked), `leaked ${leaked}`);
   for (const kept of ['AbCdEfGhIjKlMnOpQrStUvWxYz12', 'item-1', 'req-1']) assert.ok(out.includes(kept));
 });
 

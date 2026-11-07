@@ -13,13 +13,23 @@ const webhooks = new Stripe('sk_test_dummy').webhooks; // offline signing/verifi
 const token = (sub, claims = {}) => new SignJWT({ email_verified: true, ...claims }).setProtectedHeader({ alg: 'HS256' }).setSubject(sub).setIssuedAt().setExpirationTime('5m').sign(new TextEncoder().encode(JWT_SECRET));
 const future = (days = 30) => Math.floor(Date.now() / 1000) + days * 86400;
 
-function fakeStripe(subs = {}) {
+function fakeStripe(subs = {}, sessions = {}) {
   const calls = [];
+  const list = async ({ customer } = {}) => {
+    calls.push(['list', customer]);
+    return { data: Object.values(subs).filter(s => (s.customer?.id || s.customer) === customer) };
+  };
   return {
-    calls, subs, webhooks,
-    checkout: { sessions: { create: async p => { calls.push(['checkout', p]); return { id: 'cs_1', url: 'https://checkout.stripe.com/c/cs_1' }; } } },
+    calls, subs, sessions, webhooks,
+    checkout: { sessions: {
+      create: async p => { calls.push(['checkout', p]); return { id: 'cs_1', url: 'https://checkout.stripe.com/c/cs_1' }; },
+      retrieve: async id => { calls.push(['session', id]); return sessions[id] || { id, status: 'expired' }; },
+    } },
     billingPortal: { sessions: { create: async p => { calls.push(['portal', p]); return { url: 'https://billing.stripe.com/p/1' }; } } },
-    subscriptions: { retrieve: async id => { calls.push(['retrieve', id]); if (!subs[id]) throw new Error('no such sub'); return subs[id]; } },
+    subscriptions: {
+      retrieve: async id => { calls.push(['retrieve', id]); if (!subs[id]) throw new Error('no such sub'); return subs[id]; },
+      list,
+    },
   };
 }
 const sub = (o = {}) => ({ id: 'sub_1', customer: 'cus_1', status: 'active', cancel_at_period_end: false, metadata: { uid: 'u1' },
@@ -66,19 +76,21 @@ test('checkout requires auth and creates a subscription session bound to the uid
   assert.equal(p.subscription_data.metadata.uid, 'u1'); assert.deepEqual(p.line_items, [{ price: 'price_year', quantity: 1 }]);
   assert.match(p.success_url, /^https:\/\/payaviator\.app\//); assert.match(p.cancel_url, /^https:\/\/payaviator\.app\//);
   const m = await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1')}`).send({});
-  assert.equal(stripe.calls[1][1].line_items[0].price, 'price_month', 'monthly is the default'); assert.equal(m.status, 200);
+  const checkouts = stripe.calls.filter(c => c[0] === 'checkout');
+  assert.equal(checkouts[1][1].line_items[0].price, 'price_month', 'monthly is the default'); assert.equal(m.status, 200);
   assert.equal((await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1')}`).send({ plan: 'weekly' })).status, 400);
   assert.deepEqual(p.payment_method_types, ['card']); assert.equal(p.customer_email, undefined, 'no email claim -> no customer_email');
 });
 
 test('checkout passes customer_email for new customers, customer for existing ones', async () => {
-  const { app, store, stripe } = setup();
+  const { app, store, stripe } = setup({ subs: {} });
   await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1', { email: 'a@b.co' })}`).send({});
-  let p = stripe.calls[0][1]; assert.equal(p.customer_email, 'a@b.co'); assert.equal(p.customer, undefined);
-  await store.putStripeCustomer('u1', 'cus_1');
-  await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1', { email: 'a@b.co' })}`).send({});
-  p = stripe.calls[1][1]; assert.equal(p.customer, 'cus_1'); assert.equal(p.customer_email, undefined);
+  let p = stripe.calls.find(c => c[0] === 'checkout')[1]; assert.equal(p.customer_email, 'a@b.co'); assert.equal(p.customer, undefined);
+  await store.putStripeCustomer('u1', 'cus_new');
+  await request(app).post('/api/billing/stripe/checkout').set('Authorization', `Bearer ${await token('u1', { email: 'a@b.co' })}`).send({ customer: 'cus_victim', customerId: 'cus_victim', email: 'victim@x.com' });
+  p = stripe.calls.filter(c => c[0] === 'checkout')[1][1]; assert.equal(p.customer, 'cus_new'); assert.equal(p.customer_email, undefined);
   assert.deepEqual(p.payment_method_types, ['card']);
+  assert.equal(JSON.stringify(stripe.calls).includes('cus_victim'), false);
 });
 
 test('webhook rejects bad / missing signatures', async () => {

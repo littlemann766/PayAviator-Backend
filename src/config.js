@@ -1,5 +1,6 @@
 import { PlaidEnvironments } from 'plaid';
 import { parseEncryptionKey } from './crypto.js';
+import { ANDROID_APPLICATION_ID } from './billingRecovery.js';
 
 export const VALID_PLAID_ENVS = Object.keys(PlaidEnvironments); // ['production', 'sandbox']
 export const FIREBASE_JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
@@ -200,6 +201,9 @@ export function loadConfig(env = process.env) {
   };
   if (integrity.enforce && !integrity.configured) warnings.push('PLAY_INTEGRITY_ENFORCE=true but GOOGLE_PLAY_SERVICE_ACCOUNT_JSON/ANDROID_PACKAGE_NAME missing: free-tier links return 503 integrity_not_configured');
   if (isProduction && !billing.configured) warnings.push('Google Play billing not configured (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON + ANDROID_PACKAGE_NAME); second bank links will be refused');
+  if (androidPackageName && androidPackageName !== ANDROID_APPLICATION_ID) {
+    warnings.push(`ANDROID_PACKAGE_NAME is "${androidPackageName}". The Android applicationId is ${ANDROID_APPLICATION_ID}. The fixture package app.payaviator is not a verified production package; this process does not change the configured value.`);
+  }
 
   // --- FCM push (optional: missing => pushes are logged and skipped; FCM itself is free, no Blaze needed) ---
   let fcmServiceAccount = null, fcmCredentialSource = null;
@@ -227,6 +231,15 @@ export function loadConfig(env = process.env) {
     dedupeHours: 24,
   };
   if (!push.configured) warnings.push('push_not_configured: FIREBASE_SERVICE_ACCOUNT_JSON (+ FIREBASE_PROJECT_ID) missing; bank-reconnect pushes are logged and skipped');
+  // Same service-account JSON as FCM, used only for Auth getUser. Not inferred from the Play console key.
+  const accountLookup = {
+    configured: Boolean(fcmServiceAccount && fcmProjectId),
+    projectId: fcmProjectId || null,
+    serviceAccount: fcmServiceAccount,
+  };
+  if (isProduction && billing.configured && !accountLookup.configured) {
+    warnings.push('account_lookup_not_configured: Play purchases stored for another uid are not transferred. Set FIREBASE_SERVICE_ACCOUNT_JSON and FIREBASE_PROJECT_ID so Auth getUser can prove a deleted account.');
+  }
 
   if (errors.length) throw new ConfigError(errors);
 
@@ -256,6 +269,7 @@ export function loadConfig(env = process.env) {
       auth,
       corsOrigins: corsOrigins.length ? corsOrigins : ['https://appassets.androidplatform.net', 'https://payaviator.app', 'https://www.payaviator.app'],
       billing,
+      accountLookup,
       liveBalance,
       freeTier,
       stripe,
